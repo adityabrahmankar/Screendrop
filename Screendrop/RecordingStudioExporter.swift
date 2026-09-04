@@ -25,7 +25,7 @@ import SwiftUI
 nonisolated private final class StudioExportBenchmark: @unchecked Sendable {
     #if DEBUG
     private let lock = NSLock()
-    private let backend: String
+    private var backend: String
     private var frames = 0
     private var renderSeconds = 0.0
     private var writerWaitSeconds = 0.0
@@ -37,6 +37,14 @@ nonisolated private final class StudioExportBenchmark: @unchecked Sendable {
     init(backend: String) {
         #if DEBUG
         self.backend = backend
+        #endif
+    }
+
+    func setBackend(_ backend: String) {
+        #if DEBUG
+        lock.withLock {
+            self.backend = backend
+        }
         #endif
     }
 
@@ -73,6 +81,7 @@ nonisolated private final class StudioExportBenchmark: @unchecked Sendable {
         #if DEBUG
         let snapshot = lock.withLock {
             (
+                backend: backend,
                 frames: frames,
                 renderSeconds: renderSeconds,
                 writerWaitSeconds: writerWaitSeconds,
@@ -85,9 +94,9 @@ nonisolated private final class StudioExportBenchmark: @unchecked Sendable {
             ? Double(snapshot.blurSamplesTotal) / Double(snapshot.frames)
             : 0
 
-        print("""
+        let summary = """
         [Screendrop Export Benchmark]
-        backend=\(backend)
+        backend=\(snapshot.backend)
         duration=\(wallClockSeconds)
         frames=\(snapshot.frames)
         render_seconds=\(snapshot.renderSeconds)
@@ -96,7 +105,12 @@ nonisolated private final class StudioExportBenchmark: @unchecked Sendable {
         blur_samples_avg=\(averageBlurSamples)
         blur_samples_max=\(snapshot.blurSamplesMax)
         blurred_frames=\(snapshot.blurredFrames)
-        """)
+        """
+        print(summary)
+        // GUI launches can keep stdout buffered for the lifetime of the app;
+        // stderr makes DEBUG benchmark results observable without requiring
+        // the app to quit.
+        FileHandle.standardError.write(Data((summary + "\n").utf8))
         #endif
     }
 }
@@ -233,7 +247,9 @@ nonisolated final class RecordingStudioExporter: @unchecked Sendable {
         cancelFlag: CancelFlag,
         progress: @escaping @Sendable (Double) -> Void
     ) async throws -> URL {
-        let benchmark = StudioExportBenchmark(backend: "coregraphics")
+        let benchmark = StudioExportBenchmark(
+            backend: StudioScreenRenderBackend.configured.rawValue
+        )
         #if DEBUG
         let exportStartedAt = ProcessInfo.processInfo.systemUptime
         defer {
@@ -678,8 +694,31 @@ nonisolated private final class CameraFrameFeed: @unchecked Sendable {
 
 // MARK: - Frame compositor
 
-/// Draws one output frame: cached backdrop, then the zoom-transformed screen
-/// frame clipped to the rounded card, then the camera bubble.
+nonisolated private enum StudioScreenRenderBackend: String {
+    case metal
+    case coreGraphics
+
+    /// Metal is the production path; `coregraphics` is a DEBUG/reference
+    /// switch so the two rasterizers can be benchmarked on identical input.
+    static var configured: Self {
+        guard let value = ProcessInfo.processInfo.environment[
+            "SCREENDROP_STUDIO_EXPORT_BACKEND"
+        ]?.lowercased() else {
+            return .metal
+        }
+        switch value {
+        case "coregraphics", "core-graphics", "cg":
+            return .coreGraphics
+        default:
+            return .metal
+        }
+    }
+}
+
+/// Draws one output frame: the cached backdrop, the zoom-transformed screen
+/// frame clipped to the rounded card, then the Core Graphics overlay layers.
+/// The screen layer can use Metal while Core Graphics remains available as a
+/// reference backend for visual comparisons.
 nonisolated private final class StudioFrameCompositor: @unchecked Sendable {
     private let canvasSize: CGSize
     private let videoCropRect: CGRect
@@ -697,6 +736,8 @@ nonisolated private final class StudioFrameCompositor: @unchecked Sendable {
     private let pointerScale: CGFloat
     private let colorSpace: CGColorSpace
     private let backdrop: CGImage?
+    private let screenBackend: StudioScreenRenderBackend
+    private let metalRenderer: MetalStudioScreenRenderer?
     private let benchmark: StudioExportBenchmark
     /// Fixed output cadence, matching `pumpVideo`'s frame clock. Since the
     /// output timeline is gapless by construction, the shutter window for
@@ -745,12 +786,34 @@ nonisolated private final class StudioFrameCompositor: @unchecked Sendable {
         self.benchmark = benchmark
         self.pointerScale = style.cursorScale
         self.colorSpace = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
-        self.backdrop = Self.renderBackdrop(
+        let renderedBackdrop = Self.renderBackdrop(
             canvasSize: canvasSize,
             layout: layout,
             style: style,
             colorSpace: colorSpace
         )
+        self.backdrop = renderedBackdrop
+
+        let requestedBackend = StudioScreenRenderBackend.configured
+        var metalRenderer: MetalStudioScreenRenderer?
+        if requestedBackend == .metal {
+            do {
+                metalRenderer = try MetalStudioScreenRenderer(
+                    canvasSize: canvasSize,
+                    cardRect: layout.cardRect,
+                    cardCornerRadius: layout.cardCornerRadius,
+                    backdrop: renderedBackdrop
+                )
+            } catch {
+                metalRenderer = nil
+                #if DEBUG
+                print("[Screendrop Export Benchmark] Metal unavailable; using Core Graphics reference: \(error)")
+                #endif
+            }
+        }
+        self.metalRenderer = metalRenderer
+        self.screenBackend = metalRenderer == nil ? .coreGraphics : requestedBackend
+        benchmark.setBackend(self.screenBackend.rawValue)
     }
 
     /// The virtual camera for a frame: the reframe crop-and-follow track
@@ -776,6 +839,76 @@ nonisolated private final class StudioFrameCompositor: @unchecked Sendable {
         }
         #endif
 
+        // Motion blur by temporal supersampling: while the virtual camera is
+        // moving, average several sub-frame camera states across exactly one
+        // output frame. The Core Graphics and Metal paths receive the same
+        // rects and the same 1/(i + 1) running-average alpha sequence.
+        let shutter = outputFrameInterval
+        let sampleCount = blurSampleCount(at: editorTime, shutter: shutter)
+        #if DEBUG
+        benchmark.recordFrame(blurSampleCount: sampleCount)
+        #endif
+        let sampleRects = (0..<sampleCount).map { sample in
+            let sampleTime = editorTime - shutter / 2
+                + shutter * (Double(sample) + 0.5) / Double(sampleCount)
+            return layout.frameRect(for: viewportFrame(at: sampleTime))
+        }
+
+        if let metalRenderer {
+            // Metal owns the static backdrop and screen layer. Wait for the
+            // command buffer before reopening the destination for the overlay
+            // pass, which keeps the existing Core Graphics layers unchanged.
+            try metalRenderer.render(
+                screenFrame: screenFrame,
+                destination: destination,
+                sampleRects: sampleRects
+            )
+            guard withDestinationContext(destination, body: { context in
+                drawOverlays(
+                    cameraFrame: cameraFrame,
+                    editorTime: editorTime,
+                    sourceTime: sourceTime,
+                    in: context
+                )
+            }) else {
+                throw RecordingStudioExporter.ExportError.writerFailed(nil)
+            }
+            return
+        }
+
+        // Reference backend: this is the original Core Graphics raster path,
+        // retained both as a fallback when Metal is unavailable and as the
+        // visual comparison backend for export validation.
+        guard withDestinationContext(destination, body: { context in
+            drawBackdrop(in: context)
+            guard let screenImage = Self.makeImage(from: screenFrame, colorSpace: colorSpace) else {
+                return
+            }
+            context.saveGState()
+            context.addPath(roundedPath(for: layout.cardRect, radius: layout.cardCornerRadius))
+            context.clip()
+            for (sample, drawRect) in sampleRects.enumerated() {
+                // Drawing sample i at alpha 1/(i+1) keeps the buffer equal to
+                // the running average of all samples so far.
+                context.setAlpha(1 / CGFloat(sample + 1))
+                context.draw(screenImage, in: flipped(drawRect))
+            }
+            context.restoreGState()
+            drawOverlays(
+                cameraFrame: cameraFrame,
+                editorTime: editorTime,
+                sourceTime: sourceTime,
+                in: context
+            )
+        }) else {
+            throw RecordingStudioExporter.ExportError.writerFailed(nil)
+        }
+    }
+
+    private func withDestinationContext(
+        _ destination: CVPixelBuffer,
+        body: (CGContext) -> Void
+    ) -> Bool {
         CVPixelBufferLockBaseAddress(destination, [])
         defer { CVPixelBufferUnlockBaseAddress(destination, []) }
 
@@ -789,48 +922,30 @@ nonisolated private final class StudioFrameCompositor: @unchecked Sendable {
                 space: colorSpace,
                 bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue
               ) else {
-            throw RecordingStudioExporter.ExportError.writerFailed(nil)
+            return false
         }
         context.interpolationQuality = .high
+        body(context)
+        return true
+    }
 
+    private func drawBackdrop(in context: CGContext) {
         if let backdrop {
             context.draw(backdrop, in: CGRect(origin: .zero, size: canvasSize))
         } else {
             context.setFillColor(CGColor(gray: 0, alpha: 1))
             context.fill(CGRect(origin: .zero, size: canvasSize))
         }
+    }
 
-        if let screenImage = Self.makeImage(from: screenFrame, colorSpace: colorSpace) {
-            // Motion blur by temporal supersampling: while the virtual camera
-            // is moving, average several sub-frame camera states across the
-            // frame's shutter interval. Pans smear linearly, zooms radially,
-            // and settled frames pay for a single draw. The viewport timeline
-            // runs on the gapless output clock, so the shutter is always
-            // exactly one output frame - no per-call time tracking needed.
-            let shutter = outputFrameInterval
-            let sampleCount = blurSampleCount(at: editorTime, shutter: shutter)
-            #if DEBUG
-            benchmark.recordFrame(blurSampleCount: sampleCount)
-            #endif
-
-            context.saveGState()
-            context.addPath(roundedPath(for: layout.cardRect, radius: layout.cardCornerRadius))
-            context.clip()
-            for sample in 0..<sampleCount {
-                let sampleTime = editorTime - shutter / 2
-                    + shutter * (Double(sample) + 0.5) / Double(sampleCount)
-                let drawRect = layout.frameRect(for: viewportFrame(at: sampleTime))
-                // Drawing sample i at alpha 1/(i+1) keeps the buffer equal to
-                // the running average of all samples so far.
-                context.setAlpha(1 / CGFloat(sample + 1))
-                context.draw(screenImage, in: flipped(drawRect))
-
-            }
-            context.restoreGState()
-        }
-
-        // Pointer motion is resolved independently from viewport shutter
-        // blur. Its interaction magnification and tilt stay anchored at the
+    private func drawOverlays(
+        cameraFrame: CVPixelBuffer?,
+        editorTime: TimeInterval,
+        sourceTime: TimeInterval,
+        in context: CGContext
+    ) {
+        // Pointer motion is resolved independently from viewport shutter blur.
+        // Its interaction magnification and tilt stay anchored at the
         // recorded artwork anchor point, while the final point still passes
         // through the same viewport transform and rounded-card clip as the
         // source pixels.
