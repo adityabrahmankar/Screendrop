@@ -22,6 +22,85 @@ import Foundation
 import ImageIO
 import SwiftUI
 
+nonisolated private final class StudioExportBenchmark: @unchecked Sendable {
+    #if DEBUG
+    private let lock = NSLock()
+    private let backend: String
+    private var frames = 0
+    private var renderSeconds = 0.0
+    private var writerWaitSeconds = 0.0
+    private var blurSamplesTotal = 0
+    private var blurSamplesMax = 0
+    private var blurredFrames = 0
+    #endif
+
+    init(backend: String) {
+        #if DEBUG
+        self.backend = backend
+        #endif
+    }
+
+    func recordFrame(blurSampleCount: Int) {
+        #if DEBUG
+        lock.withLock {
+            frames += 1
+            blurSamplesTotal += blurSampleCount
+            blurSamplesMax = max(blurSamplesMax, blurSampleCount)
+            if blurSampleCount > 1 {
+                blurredFrames += 1
+            }
+        }
+        #endif
+    }
+
+    func recordRender(seconds: Double) {
+        #if DEBUG
+        lock.withLock {
+            renderSeconds += seconds
+        }
+        #endif
+    }
+
+    func recordWriterWait(seconds: Double) {
+        #if DEBUG
+        lock.withLock {
+            writerWaitSeconds += seconds
+        }
+        #endif
+    }
+
+    func printSummary(wallClockSeconds: Double) {
+        #if DEBUG
+        let snapshot = lock.withLock {
+            (
+                frames: frames,
+                renderSeconds: renderSeconds,
+                writerWaitSeconds: writerWaitSeconds,
+                blurSamplesTotal: blurSamplesTotal,
+                blurSamplesMax: blurSamplesMax,
+                blurredFrames: blurredFrames
+            )
+        }
+        let averageBlurSamples = snapshot.frames > 0
+            ? Double(snapshot.blurSamplesTotal) / Double(snapshot.frames)
+            : 0
+
+        print("""
+        [Screendrop Export Benchmark]
+        backend=\(backend)
+        duration=\(wallClockSeconds)
+        frames=\(snapshot.frames)
+        render_seconds=\(snapshot.renderSeconds)
+        writer_wait_seconds=\(snapshot.writerWaitSeconds)
+        blur_samples_total=\(snapshot.blurSamplesTotal)
+        blur_samples_avg=\(averageBlurSamples)
+        blur_samples_max=\(snapshot.blurSamplesMax)
+        blurred_frames=\(snapshot.blurredFrames)
+        """)
+        #endif
+    }
+}
+
 nonisolated final class RecordingStudioExporter: @unchecked Sendable {
     /// Fixed output cadence for both the writer's frame clock and the
     /// compositor's motion-blur shutter - kept as one constant so they can
@@ -154,6 +233,16 @@ nonisolated final class RecordingStudioExporter: @unchecked Sendable {
         cancelFlag: CancelFlag,
         progress: @escaping @Sendable (Double) -> Void
     ) async throws -> URL {
+        let benchmark = StudioExportBenchmark(backend: "coregraphics")
+        #if DEBUG
+        let exportStartedAt = ProcessInfo.processInfo.systemUptime
+        defer {
+            benchmark.printSummary(
+                wallClockSeconds: ProcessInfo.processInfo.systemUptime - exportStartedAt
+            )
+        }
+        #endif
+
         let sourceAsset = AVURLAsset(url: configuration.screenURL)
         let sourceDuration = try await sourceAsset.load(.duration).seconds
         let clipTimeline = configuration.clipTimeline.normalized(to: sourceDuration)
@@ -309,6 +398,7 @@ nonisolated final class RecordingStudioExporter: @unchecked Sendable {
             karaokeTimeline: configuration.karaokeTimeline,
             includeBubble: cameraFeed != nil,
             outputFrameInterval: 1 / Self.outputFrameRate,
+            benchmark: benchmark,
             reframe: configuration.reframe,
             fitContentAspect: configuration.fitContentAspect
         )
@@ -325,6 +415,7 @@ nonisolated final class RecordingStudioExporter: @unchecked Sendable {
                 cameraFeed: cameraFeed,
                 clipTimeline: clipTimeline,
                 cancelFlag: cancelFlag,
+                benchmark: benchmark,
                 progress: progress
             )
             async let audioDone: Void = pumpAudio(
@@ -365,6 +456,7 @@ nonisolated final class RecordingStudioExporter: @unchecked Sendable {
         cameraFeed: CameraFrameFeed?,
         clipTimeline: RecordingClipTimeline,
         cancelFlag: CancelFlag,
+        benchmark: StudioExportBenchmark,
         progress: @escaping @Sendable (Double) -> Void
     ) async throws {
         // Render on a fixed output clock, not per source frame. Screen
@@ -415,10 +507,18 @@ nonisolated final class RecordingStudioExporter: @unchecked Sendable {
             // render.
             guard let sourceBuffer = currentBuffer ?? pending?.buffer else { break }
 
+            #if DEBUG
+            let writerWaitStartedAt = ProcessInfo.processInfo.systemUptime
+            #endif
             while !input.isReadyForMoreMediaData {
                 if cancelFlag.isCancelled { throw ExportError.cancelled }
                 try await Task.sleep(nanoseconds: 2_000_000)
             }
+            #if DEBUG
+            benchmark.recordWriterWait(
+                seconds: ProcessInfo.processInfo.systemUptime - writerWaitStartedAt
+            )
+            #endif
 
             guard let pool = adaptor.pixelBufferPool else {
                 throw ExportError.writerFailed(nil)
@@ -597,6 +697,7 @@ nonisolated private final class StudioFrameCompositor: @unchecked Sendable {
     private let pointerScale: CGFloat
     private let colorSpace: CGColorSpace
     private let backdrop: CGImage?
+    private let benchmark: StudioExportBenchmark
     /// Fixed output cadence, matching `pumpVideo`'s frame clock. Since the
     /// output timeline is gapless by construction, the shutter window for
     /// motion-blur supersampling is always exactly one output frame - no
@@ -617,6 +718,7 @@ nonisolated private final class StudioFrameCompositor: @unchecked Sendable {
         karaokeTimeline: KaraokeTimeline? = nil,
         includeBubble: Bool,
         outputFrameInterval: TimeInterval = 1.0 / 60.0,
+        benchmark: StudioExportBenchmark,
         reframe: ReframeTrack? = nil,
         fitContentAspect: CGFloat? = nil
     ) {
@@ -640,6 +742,7 @@ nonisolated private final class StudioFrameCompositor: @unchecked Sendable {
         self.karaokeTimeline = karaokeTimeline
         self.reframe = reframe
         self.outputFrameInterval = outputFrameInterval
+        self.benchmark = benchmark
         self.pointerScale = style.cursorScale
         self.colorSpace = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
         self.backdrop = Self.renderBackdrop(
@@ -664,6 +767,15 @@ nonisolated private final class StudioFrameCompositor: @unchecked Sendable {
         sourceTime: TimeInterval,
         into destination: CVPixelBuffer
     ) throws {
+        #if DEBUG
+        let renderStartedAt = ProcessInfo.processInfo.systemUptime
+        defer {
+            benchmark.recordRender(
+                seconds: ProcessInfo.processInfo.systemUptime - renderStartedAt
+            )
+        }
+        #endif
+
         CVPixelBufferLockBaseAddress(destination, [])
         defer { CVPixelBufferUnlockBaseAddress(destination, []) }
 
@@ -697,6 +809,9 @@ nonisolated private final class StudioFrameCompositor: @unchecked Sendable {
             // exactly one output frame - no per-call time tracking needed.
             let shutter = outputFrameInterval
             let sampleCount = blurSampleCount(at: editorTime, shutter: shutter)
+            #if DEBUG
+            benchmark.recordFrame(blurSampleCount: sampleCount)
+            #endif
 
             context.saveGState()
             context.addPath(roundedPath(for: layout.cardRect, radius: layout.cardCornerRadius))
