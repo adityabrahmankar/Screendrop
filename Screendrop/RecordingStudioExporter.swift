@@ -24,10 +24,27 @@ import SwiftUI
 
 nonisolated private final class StudioExportBenchmark: @unchecked Sendable {
     #if DEBUG
+    private static let logLock = NSLock()
+    private static let logURL: URL = {
+        let directory = FileManager.default.urls(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask
+        )[0].appendingPathComponent("Screendrop", isDirectory: true)
+        try? FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true
+        )
+        return directory.appendingPathComponent("DevExportBenchmarks.log")
+    }()
+
     private let lock = NSLock()
     private var backend: String
     private var filter = "none"
     private var accumulation = "none"
+    private var outputURL = "unknown"
+    private var outputWidth = 0
+    private var outputHeight = 0
+    private var sourceDuration = 0.0
     private var frames = 0
     private var renderSeconds = 0.0
     private var writerWaitSeconds = 0.0
@@ -62,6 +79,24 @@ nonisolated private final class StudioExportBenchmark: @unchecked Sendable {
         #if DEBUG
         lock.withLock {
             self.accumulation = accumulation
+        }
+        #endif
+    }
+
+    func setOutputInfo(width: Int, height: Int, sourceDuration: Double) {
+        #if DEBUG
+        lock.withLock {
+            outputWidth = width
+            outputHeight = height
+            self.sourceDuration = sourceDuration
+        }
+        #endif
+    }
+
+    func setOutputURL(_ url: URL) {
+        #if DEBUG
+        lock.withLock {
+            outputURL = url.path
         }
         #endif
     }
@@ -102,6 +137,10 @@ nonisolated private final class StudioExportBenchmark: @unchecked Sendable {
                 backend: backend,
                 filter: filter,
                 accumulation: accumulation,
+                outputURL: outputURL,
+                outputWidth: outputWidth,
+                outputHeight: outputHeight,
+                sourceDuration: sourceDuration,
                 frames: frames,
                 renderSeconds: renderSeconds,
                 writerWaitSeconds: writerWaitSeconds,
@@ -116,9 +155,13 @@ nonisolated private final class StudioExportBenchmark: @unchecked Sendable {
 
         let summary = """
         [Screendrop Export Benchmark]
+        timestamp=\(ISO8601DateFormatter().string(from: Date()))
         backend=\(snapshot.backend)
         filter=\(snapshot.filter)
         accumulation=\(snapshot.accumulation)
+        output=\(snapshot.outputURL)
+        output_size=\(snapshot.outputWidth)x\(snapshot.outputHeight)
+        source_duration=\(snapshot.sourceDuration)
         duration=\(wallClockSeconds)
         frames=\(snapshot.frames)
         render_seconds=\(snapshot.renderSeconds)
@@ -132,7 +175,17 @@ nonisolated private final class StudioExportBenchmark: @unchecked Sendable {
         // GUI launches can keep stdout buffered for the lifetime of the app;
         // stderr makes DEBUG benchmark results observable without requiring
         // the app to quit.
-        FileHandle.standardError.write(Data((summary + "\n").utf8))
+        let data = Data((summary + "\n").utf8)
+        FileHandle.standardError.write(data)
+        Self.logLock.withLock {
+            if let handle = try? FileHandle(forWritingTo: Self.logURL) {
+                try? handle.seekToEnd()
+                try? handle.write(contentsOf: data)
+                try? handle.close()
+            } else {
+                try? data.write(to: Self.logURL, options: .atomic)
+            }
+        }
         #endif
     }
 }
@@ -309,6 +362,11 @@ nonisolated final class RecordingStudioExporter: @unchecked Sendable {
         let canvasWidth = max(2, Int(outputSize.width.rounded()) & ~1)
         let canvasHeight = max(2, Int(outputSize.height.rounded()) & ~1)
         let canvasSize = CGSize(width: canvasWidth, height: canvasHeight)
+        benchmark.setOutputInfo(
+            width: canvasWidth,
+            height: canvasHeight,
+            sourceDuration: clipTimeline.duration
+        )
 
         // Readers
         let screenReader = try AVAssetReader(asset: screenAsset)
@@ -482,6 +540,7 @@ nonisolated final class RecordingStudioExporter: @unchecked Sendable {
             try? FileManager.default.removeItem(at: outputURL)
             throw ExportError.writerFailed(writer.error)
         }
+        benchmark.setOutputURL(outputURL)
         progress(1)
         return outputURL
     }
