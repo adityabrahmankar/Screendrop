@@ -26,6 +26,8 @@ nonisolated private final class StudioExportBenchmark: @unchecked Sendable {
     #if DEBUG
     private let lock = NSLock()
     private var backend: String
+    private var filter = "none"
+    private var accumulation = "none"
     private var frames = 0
     private var renderSeconds = 0.0
     private var writerWaitSeconds = 0.0
@@ -44,6 +46,22 @@ nonisolated private final class StudioExportBenchmark: @unchecked Sendable {
         #if DEBUG
         lock.withLock {
             self.backend = backend
+        }
+        #endif
+    }
+
+    func setFilter(_ filter: String) {
+        #if DEBUG
+        lock.withLock {
+            self.filter = filter
+        }
+        #endif
+    }
+
+    func setAccumulation(_ accumulation: String) {
+        #if DEBUG
+        lock.withLock {
+            self.accumulation = accumulation
         }
         #endif
     }
@@ -82,6 +100,8 @@ nonisolated private final class StudioExportBenchmark: @unchecked Sendable {
         let snapshot = lock.withLock {
             (
                 backend: backend,
+                filter: filter,
+                accumulation: accumulation,
                 frames: frames,
                 renderSeconds: renderSeconds,
                 writerWaitSeconds: writerWaitSeconds,
@@ -97,6 +117,8 @@ nonisolated private final class StudioExportBenchmark: @unchecked Sendable {
         let summary = """
         [Screendrop Export Benchmark]
         backend=\(snapshot.backend)
+        filter=\(snapshot.filter)
+        accumulation=\(snapshot.accumulation)
         duration=\(wallClockSeconds)
         frames=\(snapshot.frames)
         render_seconds=\(snapshot.renderSeconds)
@@ -547,6 +569,7 @@ nonisolated final class RecordingStudioExporter: @unchecked Sendable {
 
             let cameraBuffer = cameraFeed?.latestFrame(at: sourceTime)
             try compositor.render(
+                frameIndex: frame,
                 screenFrame: sourceBuffer,
                 cameraFrame: cameraBuffer,
                 editorTime: editorTime,
@@ -736,8 +759,12 @@ nonisolated private final class StudioFrameCompositor: @unchecked Sendable {
     private let pointerScale: CGFloat
     private let colorSpace: CGColorSpace
     private let backdrop: CGImage?
+    private let coreGraphicsRenderer: StudioCoreGraphicsScreenRenderer
     private let screenBackend: StudioScreenRenderBackend
     private let metalRenderer: MetalStudioScreenRenderer?
+    #if DEBUG
+    private let qualityHarness: StudioScreenQualityHarness?
+    #endif
     private let benchmark: StudioExportBenchmark
     /// Fixed output cadence, matching `pumpVideo`'s frame clock. Since the
     /// output timeline is gapless by construction, the shutter window for
@@ -793,10 +820,31 @@ nonisolated private final class StudioFrameCompositor: @unchecked Sendable {
             colorSpace: colorSpace
         )
         self.backdrop = renderedBackdrop
+        let coreGraphicsRenderer = StudioCoreGraphicsScreenRenderer(
+            canvasSize: canvasSize,
+            cardRect: layout.cardRect,
+            cardCornerRadius: layout.cardCornerRadius,
+            colorSpace: colorSpace,
+            backdrop: renderedBackdrop
+        )
+        self.coreGraphicsRenderer = coreGraphicsRenderer
+
+        #if DEBUG
+        let qualityHarness = StudioScreenQualityHarness.configured(
+            canvasSize: canvasSize,
+            cardRect: layout.cardRect
+        )
+        self.qualityHarness = qualityHarness
+        #endif
 
         let requestedBackend = StudioScreenRenderBackend.configured
         var metalRenderer: MetalStudioScreenRenderer?
-        if requestedBackend == .metal {
+        #if DEBUG
+        let needsMetalRenderer = requestedBackend == .metal || qualityHarness != nil
+        #else
+        let needsMetalRenderer = requestedBackend == .metal
+        #endif
+        if needsMetalRenderer {
             do {
                 metalRenderer = try MetalStudioScreenRenderer(
                     canvasSize: canvasSize,
@@ -812,8 +860,12 @@ nonisolated private final class StudioFrameCompositor: @unchecked Sendable {
             }
         }
         self.metalRenderer = metalRenderer
-        self.screenBackend = metalRenderer == nil ? .coreGraphics : requestedBackend
+        self.screenBackend = requestedBackend == .metal && metalRenderer == nil
+            ? .coreGraphics
+            : requestedBackend
         benchmark.setBackend(self.screenBackend.rawValue)
+        benchmark.setFilter(metalRenderer?.filter.rawValue ?? "none")
+        benchmark.setAccumulation(metalRenderer?.accumulation.rawValue ?? "none")
     }
 
     /// The virtual camera for a frame: the reframe crop-and-follow track
@@ -824,6 +876,7 @@ nonisolated private final class StudioFrameCompositor: @unchecked Sendable {
     }
 
     func render(
+        frameIndex: Int,
         screenFrame: CVPixelBuffer,
         cameraFrame: CVPixelBuffer?,
         editorTime: TimeInterval,
@@ -854,6 +907,23 @@ nonisolated private final class StudioFrameCompositor: @unchecked Sendable {
             return layout.frameRect(for: viewportFrame(at: sampleTime))
         }
 
+        #if DEBUG
+        if let qualityHarness,
+           qualityHarness.shouldCapture(frameIndex: frameIndex, sampleCount: sampleCount) {
+            try qualityHarness.capture(
+                frameIndex: frameIndex,
+                editorTime: editorTime,
+                sourceTime: sourceTime,
+                sampleCount: sampleCount,
+                screenFrame: screenFrame,
+                destination: destination,
+                sampleRects: sampleRects,
+                coreGraphicsRenderer: coreGraphicsRenderer,
+                metalRenderer: metalRenderer
+            )
+        }
+        #endif
+
         if let metalRenderer {
             // Metal owns the static backdrop and screen layer. Wait for the
             // command buffer before reopening the destination for the overlay
@@ -879,21 +949,14 @@ nonisolated private final class StudioFrameCompositor: @unchecked Sendable {
         // Reference backend: this is the original Core Graphics raster path,
         // retained both as a fallback when Metal is unavailable and as the
         // visual comparison backend for export validation.
+        guard coreGraphicsRenderer.render(
+            screenFrame: screenFrame,
+            destination: destination,
+            sampleRects: sampleRects
+        ) else {
+            throw RecordingStudioExporter.ExportError.writerFailed(nil)
+        }
         guard withDestinationContext(destination, body: { context in
-            drawBackdrop(in: context)
-            guard let screenImage = Self.makeImage(from: screenFrame, colorSpace: colorSpace) else {
-                return
-            }
-            context.saveGState()
-            context.addPath(roundedPath(for: layout.cardRect, radius: layout.cardCornerRadius))
-            context.clip()
-            for (sample, drawRect) in sampleRects.enumerated() {
-                // Drawing sample i at alpha 1/(i+1) keeps the buffer equal to
-                // the running average of all samples so far.
-                context.setAlpha(1 / CGFloat(sample + 1))
-                context.draw(screenImage, in: flipped(drawRect))
-            }
-            context.restoreGState()
             drawOverlays(
                 cameraFrame: cameraFrame,
                 editorTime: editorTime,

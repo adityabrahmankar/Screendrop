@@ -96,6 +96,10 @@ struct ScreendropApp: App {
                 }
             }
         }
+
+        #if DEBUG
+        appDelegate.scheduleHarnessSessionOpen()
+        #endif
     }
 }
 
@@ -103,6 +107,40 @@ struct ScreendropApp: App {
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private let updaterManager = UpdaterManager.shared
+    #if DEBUG
+    private var didScheduleHarnessSessionOpen = false
+    #endif
+
+    #if DEBUG
+    /// Test-only convenience for opening the same recording directly when a
+    /// quality harness run is launched from Terminal. It is inert unless the
+    /// harness supplies a session path.
+    @MainActor
+    func scheduleHarnessSessionOpen() {
+        guard !didScheduleHarnessSessionOpen,
+              let rawPath = ProcessInfo.processInfo.environment[
+                  "SCREENDROP_STUDIO_SCREEN_HARNESS_SESSION"
+              ],
+              !rawPath.isEmpty else {
+            return
+        }
+        didScheduleHarnessSessionOpen = true
+        let sessionURL = URL(
+            fileURLWithPath: NSString(string: rawPath).expandingTildeInPath,
+            isDirectory: true
+        )
+        guard RecordingSession.isSessionDirectory(sessionURL) else { return }
+
+        Task { @MainActor in
+            // Let SwiftUI install the WindowGroup opener before opening the
+            // project. This avoids the same cold-launch race as Finder Open.
+            try? await Task.sleep(for: .milliseconds(350))
+            RecordingProjectOpener.shared.open(
+                RecordingSession(directoryURL: sessionURL)
+            )
+        }
+    }
+    #endif
 
     /// Files handed to us via Finder's "Open With" (or `open -a Screendrop`)
     /// before `onOpenFiles` is wired up, e.g. a cold launch where SwiftUI's

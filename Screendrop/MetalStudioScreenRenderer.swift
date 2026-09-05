@@ -14,6 +14,37 @@ import Foundation
 import Metal
 import MetalKit
 
+nonisolated enum MetalStudioScreenAccumulation: String, Sendable {
+    case fp16
+    case fp32
+
+    static var configured: Self {
+        guard let value = ProcessInfo.processInfo.environment[
+            "SCREENDROP_STUDIO_METAL_ACCUMULATION"
+        ]?.lowercased() else {
+            return .fp16
+        }
+        switch value {
+        case "fp32", "float32", "32": return .fp32
+        default: return .fp16
+        }
+    }
+
+    var pixelFormat: MTLPixelFormat {
+        switch self {
+        case .fp16: return .rgba16Float
+        case .fp32: return .rgba32Float
+        }
+    }
+
+    var textureFormatName: String {
+        switch self {
+        case .fp16: return "rgba16Float"
+        case .fp32: return "rgba32Float"
+        }
+    }
+}
+
 /// Renders the screen layer into an export pixel buffer while preserving the
 /// exporter's top-left layout coordinates. The CVMetalTextureCache lets each
 /// decoded CVPixelBuffer be used directly by Metal without a CPU image copy.
@@ -24,13 +55,17 @@ nonisolated final class MetalStudioScreenRenderer: @unchecked Sendable {
         case noLibrary
         case noFunctions
         case pipelineCreationFailed(Error?)
+        case copyPipelineCreationFailed(Error?)
         case samplerCreationFailed
+        case copySamplerCreationFailed
         case quadBufferCreationFailed
+        case accumulationTextureCreationFailed
         case backdropTextureCreationFailed(Error?)
         case sourceTextureCreationFailed(OSStatus)
         case destinationTextureCreationFailed(OSStatus)
         case commandBufferCreationFailed
         case encoderCreationFailed
+        case copyEncoderCreationFailed
         case commandFailed(Error?)
         case invalidDestinationSize
         case invalidSampleCount
@@ -46,11 +81,17 @@ nonisolated final class MetalStudioScreenRenderer: @unchecked Sendable {
             case .noFunctions:
                 "Metal could not find the Studio screen shaders."
             case .pipelineCreationFailed(let error):
-                error?.localizedDescription ?? "Metal could not create the Studio render pipeline."
+                error?.localizedDescription ?? "Metal could not create the Studio accumulation pipeline."
+            case .copyPipelineCreationFailed(let error):
+                error?.localizedDescription ?? "Metal could not create the Studio output pipeline."
             case .samplerCreationFailed:
                 "Metal could not create the Studio texture sampler."
+            case .copySamplerCreationFailed:
+                "Metal could not create the Studio accumulation sampler."
             case .quadBufferCreationFailed:
                 "Metal could not allocate the Studio quad buffer."
+            case .accumulationTextureCreationFailed:
+                "Metal could not allocate the Studio accumulation texture."
             case .backdropTextureCreationFailed(let error):
                 error?.localizedDescription ?? "Metal could not create the Studio backdrop texture."
             case .sourceTextureCreationFailed(let status):
@@ -61,6 +102,8 @@ nonisolated final class MetalStudioScreenRenderer: @unchecked Sendable {
                 "Metal could not create a Studio command buffer."
             case .encoderCreationFailed:
                 "Metal could not create a Studio render encoder."
+            case .copyEncoderCreationFailed:
+                "Metal could not create the Studio output encoder."
             case .commandFailed(let error):
                 error?.localizedDescription ?? "The Metal Studio render command failed."
             case .invalidDestinationSize:
@@ -82,11 +125,16 @@ nonisolated final class MetalStudioScreenRenderer: @unchecked Sendable {
         var canvasSize: SIMD2<Float>
         var drawRect: SIMD4<Float>
         var cardRect: SIMD4<Float>
+        var sourceSize: SIMD2<Float>
         var cardCornerRadius: Float
         var sampleAlpha: Float
+        var filterKind: UInt32
         var clipEnabled: UInt32
-        var useBicubic: UInt32
+        var resamplerEnabled: UInt32
     }
+
+    let filter: MetalStudioScreenFilter
+    let accumulation: MetalStudioScreenAccumulation
 
     private let canvasSize: CGSize
     private let cardRect: CGRect
@@ -94,16 +142,21 @@ nonisolated final class MetalStudioScreenRenderer: @unchecked Sendable {
     private let device: any MTLDevice
     private let commandQueue: any MTLCommandQueue
     private let textureCache: CVMetalTextureCache
-    private let pipelineState: any MTLRenderPipelineState
-    private let samplerState: any MTLSamplerState
+    private let accumulationPipelineState: any MTLRenderPipelineState
+    private let copyPipelineState: any MTLRenderPipelineState
+    private let screenSamplerState: any MTLSamplerState
+    private let copySamplerState: any MTLSamplerState
     private let quadBuffer: any MTLBuffer
+    private let accumulationTexture: any MTLTexture
     private let backdropTexture: (any MTLTexture)?
 
     init(
         canvasSize: CGSize,
         cardRect: CGRect,
         cardCornerRadius: CGFloat,
-        backdrop: CGImage?
+        backdrop: CGImage?,
+        filter: MetalStudioScreenFilter = .configured,
+        accumulation: MetalStudioScreenAccumulation = .configured
     ) throws {
         guard let device = MTLCreateSystemDefaultDevice() else {
             throw RendererError.noDevice
@@ -115,40 +168,68 @@ nonisolated final class MetalStudioScreenRenderer: @unchecked Sendable {
             throw RendererError.noLibrary
         }
         guard let vertexFunction = library.makeFunction(name: "studioScreenVertex"),
-              let fragmentFunction = library.makeFunction(name: "studioScreenFragment") else {
+              let fragmentFunction = library.makeFunction(name: "studioScreenFragment"),
+              let copyFragmentFunction = library.makeFunction(name: "studioScreenCopyFragment") else {
             throw RendererError.noFunctions
         }
 
-        let pipelineDescriptor = MTLRenderPipelineDescriptor()
-        pipelineDescriptor.label = "Screendrop Studio screen compositor"
-        pipelineDescriptor.vertexFunction = vertexFunction
-        pipelineDescriptor.fragmentFunction = fragmentFunction
-        pipelineDescriptor.colorAttachments[0].pixelFormat = .bgra8Unorm
-        let colorAttachment = pipelineDescriptor.colorAttachments[0]!
-        colorAttachment.isBlendingEnabled = true
-        colorAttachment.rgbBlendOperation = .add
-        colorAttachment.alphaBlendOperation = .add
-        colorAttachment.sourceRGBBlendFactor = .sourceAlpha
-        colorAttachment.destinationRGBBlendFactor = .oneMinusSourceAlpha
-        colorAttachment.sourceAlphaBlendFactor = .sourceAlpha
-        colorAttachment.destinationAlphaBlendFactor = .oneMinusSourceAlpha
+        let accumulationDescriptor = MTLRenderPipelineDescriptor()
+        accumulationDescriptor.label = "Screendrop Studio \(accumulation.rawValue.uppercased()) screen accumulation"
+        accumulationDescriptor.vertexFunction = vertexFunction
+        accumulationDescriptor.fragmentFunction = fragmentFunction
+        accumulationDescriptor.colorAttachments[0].pixelFormat = accumulation.pixelFormat
+        let accumulationAttachment = accumulationDescriptor.colorAttachments[0]!
+        accumulationAttachment.isBlendingEnabled = true
+        accumulationAttachment.rgbBlendOperation = .add
+        accumulationAttachment.alphaBlendOperation = .add
+        accumulationAttachment.sourceRGBBlendFactor = .sourceAlpha
+        accumulationAttachment.destinationRGBBlendFactor = .oneMinusSourceAlpha
+        accumulationAttachment.sourceAlphaBlendFactor = .sourceAlpha
+        accumulationAttachment.destinationAlphaBlendFactor = .oneMinusSourceAlpha
 
-        let pipelineState: any MTLRenderPipelineState
+        let accumulationPipelineState: any MTLRenderPipelineState
         do {
-            pipelineState = try device.makeRenderPipelineState(descriptor: pipelineDescriptor)
+            accumulationPipelineState = try device.makeRenderPipelineState(
+                descriptor: accumulationDescriptor
+            )
         } catch {
             throw RendererError.pipelineCreationFailed(error)
         }
 
-        let samplerDescriptor = MTLSamplerDescriptor()
-        samplerDescriptor.label = "Screendrop Studio screen sampler"
-        samplerDescriptor.minFilter = .linear
-        samplerDescriptor.magFilter = .linear
-        samplerDescriptor.mipFilter = .notMipmapped
-        samplerDescriptor.sAddressMode = .clampToEdge
-        samplerDescriptor.tAddressMode = .clampToEdge
-        guard let samplerState = device.makeSamplerState(descriptor: samplerDescriptor) else {
+        let copyDescriptor = MTLRenderPipelineDescriptor()
+        copyDescriptor.label = "Screendrop Studio 8-bit output conversion"
+        copyDescriptor.vertexFunction = vertexFunction
+        copyDescriptor.fragmentFunction = copyFragmentFunction
+        copyDescriptor.colorAttachments[0].pixelFormat = .bgra8Unorm
+        copyDescriptor.colorAttachments[0].isBlendingEnabled = false
+
+        let copyPipelineState: any MTLRenderPipelineState
+        do {
+            copyPipelineState = try device.makeRenderPipelineState(descriptor: copyDescriptor)
+        } catch {
+            throw RendererError.copyPipelineCreationFailed(error)
+        }
+
+        let screenSamplerDescriptor = MTLSamplerDescriptor()
+        screenSamplerDescriptor.label = "Screendrop Studio screen sampler"
+        screenSamplerDescriptor.minFilter = .linear
+        screenSamplerDescriptor.magFilter = .linear
+        screenSamplerDescriptor.mipFilter = .notMipmapped
+        screenSamplerDescriptor.sAddressMode = .clampToEdge
+        screenSamplerDescriptor.tAddressMode = .clampToEdge
+        guard let screenSamplerState = device.makeSamplerState(descriptor: screenSamplerDescriptor) else {
             throw RendererError.samplerCreationFailed
+        }
+
+        let copySamplerDescriptor = MTLSamplerDescriptor()
+        copySamplerDescriptor.label = "Screendrop Studio accumulation sampler"
+        copySamplerDescriptor.minFilter = .nearest
+        copySamplerDescriptor.magFilter = .nearest
+        copySamplerDescriptor.mipFilter = .notMipmapped
+        copySamplerDescriptor.sAddressMode = .clampToEdge
+        copySamplerDescriptor.tAddressMode = .clampToEdge
+        guard let copySamplerState = device.makeSamplerState(descriptor: copySamplerDescriptor) else {
+            throw RendererError.copySamplerCreationFailed
         }
 
         let vertices = [
@@ -198,22 +279,46 @@ nonisolated final class MetalStudioScreenRenderer: @unchecked Sendable {
             }
         }
 
+        guard canvasSize.width > 0, canvasSize.height > 0 else {
+            throw RendererError.invalidDestinationSize
+        }
+        let accumulationTextureDescriptor = MTLTextureDescriptor()
+        accumulationTextureDescriptor.textureType = .type2D
+        accumulationTextureDescriptor.pixelFormat = accumulation.pixelFormat
+        accumulationTextureDescriptor.width = Int(canvasSize.width.rounded())
+        accumulationTextureDescriptor.height = Int(canvasSize.height.rounded())
+        accumulationTextureDescriptor.mipmapLevelCount = 1
+        accumulationTextureDescriptor.sampleCount = 1
+        accumulationTextureDescriptor.usage = [.renderTarget, .shaderRead]
+        accumulationTextureDescriptor.storageMode = .private
+        guard let accumulationTexture = device.makeTexture(descriptor: accumulationTextureDescriptor) else {
+            throw RendererError.accumulationTextureCreationFailed
+        }
+        accumulationTexture.label = "Screendrop Studio \(accumulation.rawValue.uppercased()) accumulation"
+
+        self.filter = filter
+        self.accumulation = accumulation
         self.canvasSize = canvasSize
         self.cardRect = cardRect
         self.cardCornerRadius = cardCornerRadius
         self.device = device
         self.commandQueue = commandQueue
         self.textureCache = textureCache
-        self.pipelineState = pipelineState
-        self.samplerState = samplerState
+        self.accumulationPipelineState = accumulationPipelineState
+        self.copyPipelineState = copyPipelineState
+        self.screenSamplerState = screenSamplerState
+        self.copySamplerState = copySamplerState
         self.quadBuffer = quadBuffer
+        self.accumulationTexture = accumulationTexture
         self.backdropTexture = backdropTexture
     }
 
     /// Draws the static backdrop once and then averages the supplied screen
     /// rectangles in order. The caller supplies one through twenty-four
     /// rects, so the alpha sequence and sample count stay exactly the same as
-    /// the Core Graphics reference backend.
+    /// the Core Graphics reference backend. Samples accumulate in the
+    /// configured floating-point texture and are converted to the writer's
+    /// 8-bit BGRA buffer only once at the end.
     func render(
         screenFrame: CVPixelBuffer,
         destination: CVPixelBuffer,
@@ -243,95 +348,133 @@ nonisolated final class MetalStudioScreenRenderer: @unchecked Sendable {
         }
         commandBuffer.label = "Screendrop Studio frame"
 
-        let pass = MTLRenderPassDescriptor()
-        let attachment = pass.colorAttachments[0]!
-        attachment.texture = destinationTexture
-        attachment.loadAction = .clear
-        attachment.storeAction = .store
-        attachment.clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 1)
+        let accumulationPass = MTLRenderPassDescriptor()
+        let accumulationAttachment = accumulationPass.colorAttachments[0]!
+        accumulationAttachment.texture = accumulationTexture
+        accumulationAttachment.loadAction = .clear
+        accumulationAttachment.storeAction = .store
+        accumulationAttachment.clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 1)
 
-        guard let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: pass) else {
+        guard let accumulationEncoder = commandBuffer.makeRenderCommandEncoder(
+            descriptor: accumulationPass
+        ) else {
             throw RendererError.encoderCreationFailed
         }
-        encoder.label = "Screendrop Studio screen pass"
-        encoder.setRenderPipelineState(pipelineState)
-        encoder.setVertexBuffer(quadBuffer, offset: 0, index: 0)
-        encoder.setFragmentSamplerState(samplerState, index: 0)
+        accumulationEncoder.label = "Screendrop Studio \(accumulation.rawValue.uppercased()) screen pass"
+        accumulationEncoder.setRenderPipelineState(accumulationPipelineState)
+        accumulationEncoder.setVertexBuffer(quadBuffer, offset: 0, index: 0)
+        accumulationEncoder.setFragmentSamplerState(screenSamplerState, index: 0)
 
         if let backdropTexture {
-            var uniforms = RenderUniforms(
-                canvasSize: SIMD2<Float>(Float(canvasSize.width), Float(canvasSize.height)),
-                drawRect: SIMD4<Float>(
-                    0,
-                    0,
-                    Float(canvasSize.width),
-                    Float(canvasSize.height)
+            var uniforms = makeUniforms(
+                drawRect: CGRect(origin: .zero, size: canvasSize),
+                sourceSize: CGSize(
+                    width: backdropTexture.width,
+                    height: backdropTexture.height
                 ),
-                cardRect: SIMD4<Float>(
-                    Float(cardRect.minX),
-                    Float(cardRect.minY),
-                    Float(cardRect.width),
-                    Float(cardRect.height)
-                ),
-                cardCornerRadius: Float(cardCornerRadius),
                 sampleAlpha: 1,
-                clipEnabled: 0,
-                useBicubic: 0
+                filterKind: .area,
+                clipEnabled: false,
+                resamplerEnabled: false
             )
-            encoder.setVertexBytes(
-                &uniforms,
-                length: MemoryLayout<RenderUniforms>.stride,
-                index: 1
-            )
-            encoder.setFragmentBytes(
-                &uniforms,
-                length: MemoryLayout<RenderUniforms>.stride,
-                index: 1
-            )
-            encoder.setFragmentTexture(backdropTexture, index: 0)
-            encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
+            set(uniforms: &uniforms, on: accumulationEncoder)
+            accumulationEncoder.setFragmentTexture(backdropTexture, index: 0)
+            accumulationEncoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
         }
 
-        encoder.setFragmentTexture(sourceTexture, index: 0)
+        accumulationEncoder.setFragmentTexture(sourceTexture, index: 0)
+        let sourceSize = CGSize(width: sourceTexture.width, height: sourceTexture.height)
         for (sample, drawRect) in sampleRects.enumerated() {
-            var uniforms = RenderUniforms(
-                canvasSize: SIMD2<Float>(Float(canvasSize.width), Float(canvasSize.height)),
-                drawRect: SIMD4<Float>(
-                    Float(drawRect.minX),
-                    Float(drawRect.minY),
-                    Float(drawRect.width),
-                    Float(drawRect.height)
-                ),
-                cardRect: SIMD4<Float>(
-                    Float(cardRect.minX),
-                    Float(cardRect.minY),
-                    Float(cardRect.width),
-                    Float(cardRect.height)
-                ),
-                cardCornerRadius: Float(cardCornerRadius),
+            var uniforms = makeUniforms(
+                drawRect: drawRect,
+                sourceSize: sourceSize,
                 sampleAlpha: 1 / Float(sample + 1),
-                clipEnabled: 1,
-                useBicubic: 1
+                filterKind: filter,
+                clipEnabled: true,
+                resamplerEnabled: true
             )
-            encoder.setVertexBytes(
-                &uniforms,
-                length: MemoryLayout<RenderUniforms>.stride,
-                index: 1
-            )
-            encoder.setFragmentBytes(
-                &uniforms,
-                length: MemoryLayout<RenderUniforms>.stride,
-                index: 1
-            )
-            encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
+            set(uniforms: &uniforms, on: accumulationEncoder)
+            accumulationEncoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
         }
+        accumulationEncoder.endEncoding()
 
-        encoder.endEncoding()
+        let copyPass = MTLRenderPassDescriptor()
+        let copyAttachment = copyPass.colorAttachments[0]!
+        copyAttachment.texture = destinationTexture
+        copyAttachment.loadAction = .dontCare
+        copyAttachment.storeAction = .store
+        guard let copyEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: copyPass) else {
+            throw RendererError.copyEncoderCreationFailed
+        }
+        copyEncoder.label = "Screendrop Studio 8-bit output pass"
+        copyEncoder.setRenderPipelineState(copyPipelineState)
+        copyEncoder.setVertexBuffer(quadBuffer, offset: 0, index: 0)
+        var copyUniforms = makeUniforms(
+            drawRect: CGRect(origin: .zero, size: canvasSize),
+            sourceSize: canvasSize,
+            sampleAlpha: 1,
+            filterKind: .area,
+            clipEnabled: false,
+            resamplerEnabled: false
+        )
+        set(uniforms: &copyUniforms, on: copyEncoder)
+        copyEncoder.setFragmentSamplerState(copySamplerState, index: 0)
+        copyEncoder.setFragmentTexture(accumulationTexture, index: 0)
+        copyEncoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
+        copyEncoder.endEncoding()
+
         commandBuffer.commit()
         commandBuffer.waitUntilCompleted()
         guard commandBuffer.status == .completed else {
             throw RendererError.commandFailed(commandBuffer.error)
         }
+    }
+
+    private func makeUniforms(
+        drawRect: CGRect,
+        sourceSize: CGSize,
+        sampleAlpha: Float,
+        filterKind: MetalStudioScreenFilter,
+        clipEnabled: Bool,
+        resamplerEnabled: Bool
+    ) -> RenderUniforms {
+        RenderUniforms(
+            canvasSize: SIMD2<Float>(Float(canvasSize.width), Float(canvasSize.height)),
+            drawRect: SIMD4<Float>(
+                Float(drawRect.minX),
+                Float(drawRect.minY),
+                Float(drawRect.width),
+                Float(drawRect.height)
+            ),
+            cardRect: SIMD4<Float>(
+                Float(cardRect.minX),
+                Float(cardRect.minY),
+                Float(cardRect.width),
+                Float(cardRect.height)
+            ),
+            sourceSize: SIMD2<Float>(Float(sourceSize.width), Float(sourceSize.height)),
+            cardCornerRadius: Float(cardCornerRadius),
+            sampleAlpha: sampleAlpha,
+            filterKind: filterKind.shaderValue,
+            clipEnabled: clipEnabled ? 1 : 0,
+            resamplerEnabled: resamplerEnabled ? 1 : 0
+        )
+    }
+
+    private func set(
+        uniforms: inout RenderUniforms,
+        on encoder: any MTLRenderCommandEncoder
+    ) {
+        encoder.setVertexBytes(
+            &uniforms,
+            length: MemoryLayout<RenderUniforms>.stride,
+            index: 1
+        )
+        encoder.setFragmentBytes(
+            &uniforms,
+            length: MemoryLayout<RenderUniforms>.stride,
+            index: 1
+        )
     }
 
     private func texture(
