@@ -1,0 +1,109 @@
+--- a/ExportReview/run_native_final.py
++++ b/ExportReview/run_native_final.py
+@@ -28,7 +28,8 @@
+ audio_matched = 0
+ audio_tail_variations: list[dict] = []
+ audio_reference_variants: list[dict] = []
+-audio_variant_matches: list[dict] = []
++audio_checks: list[dict] = []
++retimed_pcm_not_bit_identical: list[dict] = []
+ 
+ def metrics(log: str) -> dict:
+     values = {}
+@@ -103,6 +104,49 @@
+     print(f'PASS {label} ({time.monotonic()-started:.2f}s process)', flush=True)
+     return folder
+ 
++def retimed_audio_checks(old: Path, new: Path, reference: dict, actual: dict) -> dict:
++    """Structural/signal regression checks, NOT a claim of waveform equality.
++
++    Pass1 itself is not bit-repeatable near retiming boundaries. Exact equality
++    still gates unretimed and replacement audio; retimed sample differences are
++    retained as an explicit limitation rather than blessed by a hash allowlist.
++    """
++    for key in ('format', 'plane_channels', 'range_start', 'range_end'):
++        assert actual[key] == reference[key], f'retimed audio {key} changed'
++    fmt = actual['format']
++    assert fmt == dict(bits=32, bytes_per_frame=8, channels=2, flags=9, rate=48000), 'unexpected fixture PCM format'
++    rate, channels = 48000, 2
++    expected = round((actual['range_end'] - actual['range_start']) * rate)
++    assert abs(actual['samples'] - expected) <= 96, 'retimed audio endpoint differs by more than 2 ms'
++    assert actual['clock_runs'] == [[0, actual['samples']]], 'retimed audio has a gap or timestamp discontinuity'
++    assert actual['bytes'] == actual['samples'] * 8, 'retimed PCM length mismatch'
++    source_bytes = (old / 'audio.plane0.pcm').read_bytes()
++    output_bytes = (new / 'audio.plane0.pcm').read_bytes()
++    # The fixture's first segment is unretimed. Exclude the transition's DSP
++    # support window, but require exact PCM over its first 1.8 seconds.
++    prefix_bytes = int(1.8 * rate) * 8
++    assert output_bytes[:prefix_bytes] == source_bytes[:prefix_bytes], 'unretimed prefix PCM changed'
++    output = array.array('f')
++    output.frombytes(output_bytes)
++    if sys.byteorder != 'little': output.byteswap()
++    assert all(math.isfinite(x) and abs(x) <= 1 for x in output), 'nonfinite or clipped PCM'
++    assert output[::2] == output[1::2], 'generated stereo channels diverged'
++    mono = output[::channels]
++    windows = []
++    for start, end in ((0.3, 1.7), (2.2, 2.45)):
++        samples = mono[round(start * rate):round(end * rate)]
++        assert len(samples) == round((end-start) * rate), 'missing steady-state audio'
++        crossings = [i for i in range(1, len(samples)) if samples[i-1] < 0 <= samples[i]]
++        assert len(crossings) >= 2, 'silent or invalid tone'
++        hz = (len(crossings)-1) * rate / (crossings[-1]-crossings[0])
++        rms = math.sqrt(sum(x*x for x in samples) / len(samples))
++        assert 438 <= hz <= 442, f'440 Hz fixture pitch changed: {hz}'
++        assert 0.16 <= rms <= 0.185, f'fixture loudness changed: {rms}'
++        windows.append(dict(start=start, end=end, frequency_hz=hz, rms=rms))
++    return dict(exact_unretimed_prefix_seconds=1.8, endpoint_error_samples=actual['samples']-expected,
++                contiguous_sample_clock=True, signal_windows=windows,
++                limitation='Retiming-boundary waveform equality is not established; listening/physical acceptance remains open')
++
+ def compare(mode: str, backend: str = 'metal', depth: str = '3'):
+     global matched, audio_matched
+     suffix = f'{backend}-{mode}-depth{depth}'
+@@ -119,20 +163,22 @@
+     assert (old/'audio.json').exists() == (new/'audio.json').exists(), f'{suffix}: audio disappeared'
+     if (old/'audio.json').exists():
+         old_audio, new_audio = (json.loads((x/'audio.json').read_text()) for x in (old,new))
+-        if old_audio['in_timeline'] != new_audio['in_timeline']:
+-            # These fixtures have identical source audio, clip edits and settings;
+-            # only their video/overlay/container configuration differs. The fixed
+-            # baseline-only repeatability corpus is collected BEFORE candidates.
+-            same_audio_edits = mode in ('all', 'plain', 'crop', 'portrait', 'fit',
+-                'wallpaper', 'hevc', 'mov', 'no-overlays', 'camera-hidden', '4k')
+-            matches = [i for i, variant in enumerate(audio_reference_variants)
+-                       if variant == new_audio['in_timeline']] if same_audio_edits else []
+-            assert matches, f'{suffix}: PCM/timing is not byte-exact to any observed independent baseline: {old_audio} vs {new_audio}'
+-            audio_variant_matches.append(dict(case=suffix, exact_baseline_variant=matches[0],
+-                reason='Independent baseline itself produces more than one PCM realization'))
++        reference, actual = old_audio['in_timeline'], new_audio['in_timeline']
++        retimed = mode in ('all', 'plain', 'crop', 'portrait', 'fit', 'wallpaper',
++                          'hevc', 'mov', 'no-overlays', 'camera-hidden', '4k')
++        check = dict(case=suffix, paired_pcm_exact=reference == actual)
++        if retimed:
++            check.update(retimed_audio_checks(old, new, reference, actual))
++            if reference != actual:
++                matches = [i for i, variant in enumerate(audio_reference_variants) if variant == actual]
++                retimed_pcm_not_bit_identical.append(dict(case=suffix, reference=reference, actual=actual,
++                                                         exact_observed_baseline_variant=matches[0] if matches else None))
++        else:
++            assert reference == actual, f'{suffix}: deterministic PCM or timing changed: {old_audio} vs {new_audio}'
++        if reference == actual: audio_matched += 1
++        audio_checks.append(check)
+         if old_audio['full_stream'] != new_audio['full_stream']:
+             audio_tail_variations.append(dict(case=suffix, baseline=old_audio, candidate=new_audio))
+-        audio_matched += 1
+     if mode != 'all':
+         for folder in (old, new):
+             for movie in folder.glob('export.*'): movie.unlink()
+@@ -199,6 +245,9 @@
+                reference='pass1 2e891f6; identical fixture entry point + observation probes only',
+                cases=list(cases), reports=reports, out_of_cut_audio_tail_variations=audio_tail_variations,
+                baseline_audio_repeatability=dict(runs=8, variants=audio_reference_variants,
+-                   differences=repeatability_differences), exact_audio_variant_matches=audio_variant_matches)
++                   differences=repeatability_differences), audio_checks=audio_checks,
++               retimed_pcm_not_bit_identical=retimed_pcm_not_bit_identical,
++               audio_limitation='Retimed audio is checked for prefix equality, contiguous timing, pitch and loudness, not boundary waveform equality')
+ (out/'summary.json').write_text(json.dumps(summary, indent=2, sort_keys=True))
+-print(f'PASS: {matched} complete-frame hashes equal; {audio_matched} in-cut PCM matches to observed baseline realizations; PTS/readback; cancellation/faults', flush=True)
++print(f'PASS: {matched} complete-frame hashes equal; {audio_matched} paired PCM matches; {len(audio_checks)} audio structural/signal checks; PTS/readback; cancellation/faults', flush=True)
++print(f'LIMITATION: {len(retimed_pcm_not_bit_identical)} retimed cases are not paired-bit-identical; baseline itself varies. Boundary waveform parity remains unverified.', flush=True)
