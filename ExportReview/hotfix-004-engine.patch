@@ -1,0 +1,221 @@
+--- a/Screendrop/RecordingStudioExporter.swift
++++ b/Screendrop/RecordingStudioExporter.swift
+@@ -56,6 +56,7 @@
+     private var stages: [String: Double] = [:]
+     private var reusedFrames = 0
+     private var peakSlots = 0
++    private var pipelineDepth = 1
+     #endif
+ 
+     init(backend: String) {
+@@ -144,6 +145,12 @@
+     func recordReuse() {
+         #if DEBUG
+         lock.withLock { reusedFrames += 1 }
++        #endif
++    }
++
++    func setPipelineDepth(_ depth: Int) {
++        #if DEBUG
++        lock.withLock { pipelineDepth = depth }
+         #endif
+     }
+ 
+@@ -177,7 +184,7 @@
+             : 0
+ 
+         let extra = lock.withLock {
+-            "pipeline_depth=\(StudioExportPipelineOptions.depth)\n"
++            "pipeline_depth=\(pipelineDepth)\n"
+                 + "peak_slots=\(peakSlots)\nreused_frames=\(reusedFrames)\n"
+                 + stages.keys.sorted().map { "\($0)=\(stages[$0] ?? 0)" }.joined(separator: "\n")
+         }
+@@ -208,7 +215,7 @@
+         FileHandle.standardError.write(data)
+         Self.logLock.withLock {
+             if let handle = try? FileHandle(forWritingTo: Self.logURL) {
+-                try? handle.seekToEnd()
++                _ = try? handle.seekToEnd()
+                 try? handle.write(contentsOf: data)
+                 try? handle.close()
+             } else {
+@@ -362,6 +369,7 @@
+         }
+         #endif
+ 
++        try cancelFlag.check()
+         let sourceAsset = AVURLAsset(url: configuration.screenURL)
+         let sourceDuration = try await sourceAsset.load(.duration).seconds
+         let clipTimeline = configuration.clipTimeline.normalized(to: sourceDuration)
+@@ -670,9 +678,13 @@
+         #if DEBUG
+         let frameProbe = try StudioExportFrameProbe.make()
+         #endif
+-        let depth = StudioExportPipelineOptions.depth
++        guard let pool = adaptor.pixelBufferPool else { throw ExportError.writerFailed(writer.error) }
++        let dimensions = CVPixelBufferPoolGetPixelBufferAttributes(pool) as? [String: Any]
++        let depth = StudioExportPipelineOptions.depth(
++            width: dimensions?[kCVPixelBufferWidthKey as String] as? Int ?? 0,
++            height: dimensions?[kCVPixelBufferHeightKey as String] as? Int ?? 0)
++        benchmark.setPipelineDepth(depth)
+         let permitsReuse = compositor.permitsFrameReuse
+-        guard let pool = adaptor.pixelBufferPool else { throw ExportError.writerFailed(writer.error) }
+ 
+         func nextSourceFrame() throws -> (buffer: CVPixelBuffer, time: TimeInterval)? {
+             #if DEBUG
+@@ -698,10 +710,21 @@
+         var slots: [StudioExportFrameSlot] = []
+         slots.reserveCapacity(depth)
+         var previousVisual: StudioExportVisualFrame?
++        var progressGate = StudioExportProgressGate()
++        // Do not let a cancelled export leave its bounded GPU work outstanding
++        // when the worker exits. Texture leases also protect the error paths
++        // where submission succeeded but its slot was not yet added.
++        defer {
++            for slot in slots { try? slot.visual.submission?.waitUntilCompleted() }
++        }
+ 
+         func prepareNextFrame() throws -> StudioExportFrameSlot {
+             try cancelFlag.check()
+             let index = nextFrameIndex
++            #if DEBUG
++            try StudioExportReviewFault.check("video", ordinal: index)
++            if StudioExportReviewFault.shouldFail("writer", ordinal: index) { writer.cancelWriting() }
++            #endif
+             let editorTime = Double(index) / frameRate
+             guard let location = clipIndex.location(at: editorTime) else {
+                 throw ExportError.writerFailed(nil)
+@@ -742,8 +765,14 @@
+                 visual = previousVisual
+                 benchmark.recordReuse()
+             } else {
++                #if DEBUG
++                let allocationStarted = ProcessInfo.processInfo.systemUptime
++                #endif
+                 var destination: CVPixelBuffer?
+                 let status = CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pool, &destination)
++                #if DEBUG
++                benchmark.recordStage("allocate_seconds", seconds: ProcessInfo.processInfo.systemUptime - allocationStarted)
++                #endif
+                 guard status == kCVReturnSuccess, let destination else {
+                     throw ExportError.pixelBufferAllocationFailed(status)
+                 }
+@@ -808,7 +837,11 @@
+                 #if DEBUG
+                 benchmark.recordStage("append_seconds", seconds: ProcessInfo.processInfo.systemUptime - appendStarted)
+                 #endif
+-                if slot.index % 10 == 0 { progress(min(0.98, Double(slot.index) / Double(frameCount))) }
++                let fraction = min(0.98, Double(slot.index) / Double(frameCount))
++                if slot.index % 10 == 0,
++                   progressGate.shouldReport(fraction, at: ProcessInfo.processInfo.systemUptime) {
++                    progress(fraction)
++                }
+             }
+         }
+         try Self.checkReader(reader, control: cancelFlag)
+@@ -836,6 +869,10 @@
+                     cancelFlag.removeHandler(cancellation)
+                 }
+                 do {
++                    #if DEBUG
++                    let audioProbe = try StudioExportAudioProbe.make()
++                    var audioOrdinal = 0
++                    #endif
+                     while try autoreleasepool(invoking: { () throws -> Bool in
+                         try cancelFlag.check()
+                         // Discover EOF before waiting for readiness. Otherwise
+@@ -846,9 +883,17 @@
+                         }
+                         try Self.waitForWriter(io.input, writer: io.writer, control: cancelFlag, wake: wake)
+                         try cancelFlag.check()
++                        #if DEBUG
++                        try StudioExportReviewFault.check("audio", ordinal: audioOrdinal)
++                        audioOrdinal += 1
++                        try audioProbe?.record(sample)
++                        #endif
+                         guard io.input.append(sample) else { throw ExportError.writerFailed(io.writer.error) }
+                         return true
+                     }) {}
++                    #if DEBUG
++                    try audioProbe?.finish()
++                    #endif
+                     io.input.markAsFinished()
+                     continuation.resume()
+                 } catch {
+@@ -1086,13 +1131,14 @@
+                 currentFrame = pending.buffer
+                 pendingFrame = nil
+             }
+-            guard let sample = output.copyNextSampleBuffer() else {
+-                isFinished = true
+-                break
+-            }
+-            guard let buffer = CMSampleBufferGetImageBuffer(sample) else { continue }
+-            let time = CMSampleBufferGetPresentationTimeStamp(sample).seconds + offset
+-            pendingFrame = (buffer: buffer, time: time)
++            let decoded = autoreleasepool { () -> (buffer: CVPixelBuffer?, time: TimeInterval)? in
++                guard let sample = output.copyNextSampleBuffer() else { return nil }
++                return (CMSampleBufferGetImageBuffer(sample),
++                        CMSampleBufferGetPresentationTimeStamp(sample).seconds + offset)
++            }
++            guard let decoded else { isFinished = true; break }
++            guard let buffer = decoded.buffer else { continue }
++            pendingFrame = (buffer: buffer, time: decoded.time)
+         }
+         if reader.status == .failed || reader.status == .cancelled {
+             throw reader.error ?? RecordingStudioExporter.ExportError.cancelled
+@@ -1401,6 +1447,10 @@
+         sourceTime: TimeInterval,
+         into destination: CVPixelBuffer
+     ) throws {
++        guard (cameraFrame != nil && layout.bubbleRect.width > 0)
++            || pointerTimeline?.frame(at: editorTime) != nil
++            || keystrokeTimeline?.frame(at: sourceTime) != nil
++            || subtitleTimeline?.text(at: sourceTime) != nil else { return }
+         guard withDestinationContext(destination, body: { context in
+             drawOverlays(cameraFrame: cameraFrame, editorTime: editorTime,
+                          sourceTime: sourceTime, in: context)
+--- a/Screendrop/StudioExportScheduling.swift
++++ b/Screendrop/StudioExportScheduling.swift
+@@ -146,6 +146,22 @@
+         return min(3, max(1, raw.flatMap(Int.init) ?? 3))
+     }
+ 
++    /// Limits application-owned pending destinations to about 128 MiB,
++    /// excluding decoder/encoder internals and the shared accumulation target.
++    /// A single very large frame is still allowed; resolution is never reduced.
++    static func depth(width: Int, height: Int) -> Int {
++        resolvedDepth(requested: depth, width: width, height: height)
++    }
++
++    static func resolvedDepth(requested: Int, width: Int, height: Int) -> Int {
++        let budget = 128 * 1024 * 1024
++        guard width > 0, height > 0 else { return 1 }
++        let (pixels, pixelOverflow) = width.multipliedReportingOverflow(by: height)
++        let (bytes, byteOverflow) = pixels.multipliedReportingOverflow(by: 4)
++        guard !pixelOverflow, !byteOverflow, bytes > 0 else { return 1 }
++        return min(3, max(1, requested), max(1, budget / bytes))
++    }
++
+     static var reusesIdenticalFrames: Bool {
+         ProcessInfo.processInfo.environment["SCREENDROP_STUDIO_EXPORT_REUSE"] != "0"
+     }
+@@ -154,3 +170,18 @@
+         ProcessInfo.processInfo.environment["SCREENDROP_STUDIO_EXPORT_TEXT_CACHE"] != "0"
+     }
+ }
++
++/// UI progress is not a frame clock. Keep fast exports from enqueueing a
++/// main-actor task for every few frames; final completion is reported separately.
++nonisolated struct StudioExportProgressGate {
++    private var lastTime = -Double.infinity
++    private var lastProgress = -Double.infinity
++
++    mutating func shouldReport(_ progress: Double, at time: TimeInterval) -> Bool {
++        guard progress.isFinite, time.isFinite, progress > lastProgress,
++              time - lastTime >= 0.1 else { return false }
++        lastTime = time
++        lastProgress = progress
++        return true
++    }
++}
