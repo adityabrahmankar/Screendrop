@@ -1,0 +1,12 @@
+--- a/ExportReview/run_native.py
++++ b/ExportReview/run_native.py
+@@ -44,7 +44,8 @@
+         report = json.loads((folder / 'result.json').read_text())
+         report.update(label=label, binary=str(binary), process_seconds=time.monotonic()-started)
+         reports.append(report)
+-        assert f'backend={backend}' in result.stdout, f'{label}: backend fell back or was not recorded'
++        reported_backend = 'coreGraphics' if backend == 'coregraphics' else backend
++        assert f'backend={reported_backend}' in result.stdout, f'{label}: backend fell back or was not recorded'
+     print(f'PASS {label} ({time.monotonic()-started:.2f}s process)', flush=True)
+     return folder
+ 
