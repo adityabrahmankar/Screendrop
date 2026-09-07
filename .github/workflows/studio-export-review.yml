@@ -10,7 +10,7 @@ concurrency:
 jobs:
   build:
     runs-on: macos-26
-    timeout-minutes: 30
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
         with:
@@ -19,10 +19,11 @@ jobs:
       - name: Environment
         run: |
           if [ -d /Applications/Xcode_26.4.app/Contents/Developer ]; then
-            echo 'DEVELOPER_DIR=/Applications/Xcode_26.4.app/Contents/Developer' >> "$GITHUB_ENV"
+            export DEVELOPER_DIR=/Applications/Xcode_26.4.app/Contents/Developer
+            echo "DEVELOPER_DIR=$DEVELOPER_DIR" >> "$GITHUB_ENV"
           fi
           mkdir -p "$RUNNER_TEMP/review-results"
-          { sw_vers; uname -m; xcodebuild -version; system_profiler SPDisplaysDataType; } | tee "$RUNNER_TEMP/review-results/environment.txt"
+          { sw_vers; uname -m; xcodebuild -version; system_profiler SPDisplaysDataType; echo 'Runtime validation: Debug with -O; production Release built separately'; } | tee "$RUNNER_TEMP/review-results/environment.txt"
       - name: Apply exact candidate in working tree only
         run: |
           python3 - <<'PY'
@@ -43,6 +44,7 @@ jobs:
             git apply --check "$fix"
             git apply "$fix"
           done
+          cp ExportReview/run_native_final.py ExportReview/run_native.py
           git diff --check
           git diff --stat
       - name: Scheduling and cancellation unit tests
@@ -50,38 +52,107 @@ jobs:
           set -o pipefail
           xcrun swiftc -O -swift-version 6 Screendrop/RecordingClipTimeline.swift Screendrop/StudioExportScheduling.swift ExportReview/SchedulingTests.swift -o "$RUNNER_TEMP/scheduling-tests"
           "$RUNNER_TEMP/scheduling-tests" | tee "$RUNNER_TEMP/review-results/scheduling-tests.txt"
-      - name: Build candidate Debug
+      - name: Build optimized candidate Debug
         run: |
           status=0
-          xcodebuild build -project Screendrop.xcodeproj -scheme Screendrop -configuration Debug -destination 'generic/platform=macOS' -derivedDataPath "$RUNNER_TEMP/StudioDebug" CODE_SIGNING_ALLOWED=NO ARCHS=arm64 ONLY_ACTIVE_ARCH=YES > "$RUNNER_TEMP/review-results/studio-debug.log" 2>&1 || status=$?
+          xcodebuild build -project Screendrop.xcodeproj -scheme Screendrop -configuration Debug -destination 'generic/platform=macOS' -derivedDataPath "$RUNNER_TEMP/StudioDebug" CODE_SIGNING_ALLOWED=NO ARCHS=arm64 ONLY_ACTIVE_ARCH=YES SWIFT_OPTIMIZATION_LEVEL=-O > "$RUNNER_TEMP/review-results/studio-debug.log" 2>&1 || status=$?
           grep -E 'error:|warning:|BUILD SUCCEEDED|BUILD FAILED' "$RUNNER_TEMP/review-results/studio-debug.log" | tail -100 || true
           exit "$status"
-      - name: Build candidate Release
+      - name: Build production Release
         run: |
           status=0
           xcodebuild build -project Screendrop.xcodeproj -scheme Screendrop -configuration Release -destination 'generic/platform=macOS' -derivedDataPath "$RUNNER_TEMP/StudioRelease" CODE_SIGNING_ALLOWED=NO ARCHS=arm64 ONLY_ACTIVE_ARCH=YES > "$RUNNER_TEMP/review-results/studio-release.log" 2>&1 || status=$?
           grep -E 'error:|warning:|BUILD SUCCEEDED|BUILD FAILED' "$RUNNER_TEMP/review-results/studio-release.log" | tail -100 || true
           exit "$status"
-      - name: Build pinned pass1 with probe only
+      - name: Build pinned pass1 with observation probes only
         run: |
           git worktree add --detach "$RUNNER_TEMP/pass1" 2e891f6ac625fe10c48d8e0f03506dc575e879b3
           python3 ExportReview/prepare_baseline.py "$GITHUB_WORKSPACE" "$RUNNER_TEMP/pass1"
           status=0
-          xcodebuild build -project "$RUNNER_TEMP/pass1/Screendrop.xcodeproj" -scheme Screendrop -configuration Debug -destination 'generic/platform=macOS' -derivedDataPath "$RUNNER_TEMP/StudioBaseline" CODE_SIGNING_ALLOWED=NO ARCHS=arm64 ONLY_ACTIVE_ARCH=YES > "$RUNNER_TEMP/review-results/studio-baseline.log" 2>&1 || status=$?
+          xcodebuild build -project "$RUNNER_TEMP/pass1/Screendrop.xcodeproj" -scheme Screendrop -configuration Debug -destination 'generic/platform=macOS' -derivedDataPath "$RUNNER_TEMP/StudioBaseline" CODE_SIGNING_ALLOWED=NO ARCHS=arm64 ONLY_ACTIVE_ARCH=YES SWIFT_OPTIMIZATION_LEVEL=-O > "$RUNNER_TEMP/review-results/studio-baseline.log" 2>&1 || status=$?
           grep -E 'error:|warning:|BUILD SUCCEEDED|BUILD FAILED' "$RUNNER_TEMP/review-results/studio-baseline.log" | tail -100 || true
           exit "$status"
-      - name: Full-frame parity and real export regression tests
+      - name: Raw pixel and PCM parity, failures, benchmarks and one-hour export
+        env:
+          SCREENDROP_RUN_SOAK: '1'
         run: |
           set -o pipefail
           python3 ExportReview/run_native.py "$RUNNER_TEMP/StudioDebug/Build/Products/Debug/Screendrop.app/Contents/MacOS/Screendrop" "$RUNNER_TEMP/StudioBaseline/Build/Products/Debug/Screendrop.app/Contents/MacOS/Screendrop" "$RUNNER_TEMP/review-results/native" | tee "$RUNNER_TEMP/review-results/native-tests.log"
-      - name: Archive exact tested source
+      - name: Archive exact tested source and manifest
         if: always()
         run: |
-          tar -czf "$RUNNER_TEMP/review-results/tested-source.tar.gz" Screendrop ExportReview .github/workflows/studio-export-review.yml
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib
+          paths = ['Screendrop/MetalStudioScreenRenderer.swift', 'Screendrop/RecordingStudioExporter.swift', 'Screendrop/ScreendropApp.swift', 'Screendrop/StudioExportScheduling.swift', 'Screendrop/StudioExportReview.swift', 'ExportReview/SchedulingTests.swift', 'ExportReview/prepare_baseline.py', 'ExportReview/run_native.py']
+          hashes = {p: hashlib.sha256(pathlib.Path(p).read_bytes()).hexdigest() for p in paths if pathlib.Path(p).is_file()}
+          pathlib.Path(os.environ['RUNNER_TEMP'], 'review-results', 'source-manifest.json').write_text(json.dumps(hashes, indent=2, sort_keys=True))
+          PY
+          tar -czf "$RUNNER_TEMP/review-results/tested-source.tar.gz" Screendrop ExportReview docs/STUDIO_EXPORT_TODO.md .github/workflows/studio-export-review.yml
           git diff --binary > "$RUNNER_TEMP/review-results/tested.patch"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: export-review-results
           path: ${{ runner.temp }}/review-results
+          retention-days: 7
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 2e891f6ac625fe10c48d8e0f03506dc575e879b3
+          fetch-depth: 0
+          persist-credentials: true
+      - uses: actions/download-artifact@v4
+        with:
+          name: export-review-results
+          path: ${{ runner.temp }}/validated
+      - name: Materialize only allowlisted validated source and evidence
+        env:
+          REVIEW_COMMIT: ${{ github.sha }}
+          REVIEW_RUN: ${{ github.run_id }}
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, shutil, tarfile
+          root = pathlib.Path(os.environ['RUNNER_TEMP'], 'validated')
+          manifest = json.loads((root / 'source-manifest.json').read_text())
+          allowed = ['Screendrop/MetalStudioScreenRenderer.swift', 'Screendrop/RecordingStudioExporter.swift', 'Screendrop/ScreendropApp.swift', 'Screendrop/StudioExportScheduling.swift', 'Screendrop/StudioExportReview.swift', 'ExportReview/SchedulingTests.swift', 'ExportReview/prepare_baseline.py', 'ExportReview/run_native.py']
+          assert set(manifest) == set(allowed)
+          with tarfile.open(root / 'tested-source.tar.gz') as archive:
+              for name in allowed:
+                  item = archive.extractfile(name)
+                  assert item is not None
+                  data = item.read()
+                  assert hashlib.sha256(data).hexdigest() == manifest[name]
+                  path = pathlib.Path(name)
+                  path.parent.mkdir(parents=True, exist_ok=True)
+                  path.write_bytes(data)
+              todo = archive.extractfile('docs/STUDIO_EXPORT_TODO.md').read().decode()
+          for marker in ['Build and run the final candidate', 'Complete a real 216,000-frame', 'Publish ordinary source commits']:
+              todo = todo.replace('- [ ] ' + marker, '- [x] ' + marker)
+          pathlib.Path('docs/STUDIO_EXPORT_TODO.md').write_text(todo)
+          evidence = pathlib.Path('docs/export-validation')
+          evidence.mkdir(parents=True, exist_ok=True)
+          for name in ['source-manifest.json', 'environment.txt', 'scheduling-tests.txt', 'native-tests.log']:
+              shutil.copy2(root / name, evidence / name)
+          shutil.copy2(root / 'native/summary.json', evidence / 'summary.json')
+          (evidence / 'provenance.json').write_text(json.dumps(dict(baseline='2e891f6ac625fe10c48d8e0f03506dc575e879b3', review_commit=os.environ['REVIEW_COMMIT'], run_id=os.environ['REVIEW_RUN'], runtime_build='Debug with SWIFT_OPTIMIZATION_LEVEL=-O', release_build='ordinary Release, probes compiled out', limitation='Hosted paravirtual GPU; not a physical M-series benchmark'), indent=2))
+          PY
+          git diff --check
+      - name: Publish ordinary source commit without changing main or pass1
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add Screendrop/MetalStudioScreenRenderer.swift Screendrop/RecordingStudioExporter.swift Screendrop/ScreendropApp.swift Screendrop/StudioExportScheduling.swift Screendrop/StudioExportReview.swift ExportReview/SchedulingTests.swift ExportReview/prepare_baseline.py ExportReview/run_native.py docs/STUDIO_EXPORT_TODO.md docs/export-validation
+          git commit -m 'perf: pipeline Studio export with bounded frame ownership and verified feature parity'
+          git push origin HEAD:refs/heads/perf/metal-studio-export-pass2
+          git rev-parse HEAD | tee "$RUNNER_TEMP/published-commit.txt"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: published-commit
+          path: ${{ runner.temp }}/published-commit.txt
           retention-days: 7
