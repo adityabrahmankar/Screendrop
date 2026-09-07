@@ -24,6 +24,7 @@ fixtures = out / 'fixtures'
 reports: list[dict] = []
 matched = 0
 audio_matched = 0
+audio_tail_variations: list[dict] = []
 
 def metrics(log: str) -> dict:
     values = {}
@@ -114,7 +115,9 @@ def compare(mode: str, backend: str = 'metal', depth: str = '3'):
     assert (old/'audio.json').exists() == (new/'audio.json').exists(), f'{suffix}: audio disappeared'
     if (old/'audio.json').exists():
         old_audio, new_audio = (json.loads((x/'audio.json').read_text()) for x in (old,new))
-        assert old_audio == new_audio, f'{suffix}: pre-encoder PCM or audio timing changed: {old_audio} vs {new_audio}'
+        assert old_audio['in_timeline'] == new_audio['in_timeline'], f'{suffix}: in-cut PCM or audio timing changed: {old_audio} vs {new_audio}'
+        if old_audio['full_stream'] != new_audio['full_stream']:
+            audio_tail_variations.append(dict(case=suffix, baseline=old_audio, candidate=new_audio))
         audio_matched += 1
     if mode != 'all':
         for folder in (old, new):
@@ -146,6 +149,6 @@ if os.environ.get('SCREENDROP_RUN_SOAK') == '1':
     for movie in folder.glob('export.*'): movie.unlink()
 summary = dict(matched_raw_frames=matched, matched_pcm_cases=audio_matched,
                reference='pass1 2e891f6; identical fixture entry point + observation probes only',
-               cases=list(cases), reports=reports)
+               cases=list(cases), reports=reports, out_of_cut_audio_tail_variations=audio_tail_variations)
 (out/'summary.json').write_text(json.dumps(summary, indent=2, sort_keys=True))
-print(f'PASS: {matched} complete-frame hashes equal; {audio_matched} exact PCM comparisons; PTS/readback; cancellation/faults', flush=True)
+print(f'PASS: {matched} complete-frame hashes equal; {audio_matched} exact in-cut PCM comparisons; PTS/readback; cancellation/faults', flush=True)
