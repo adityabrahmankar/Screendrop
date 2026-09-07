@@ -1,0 +1,29 @@
+--- a/Screendrop/RecordingStudioExporter.swift
++++ b/Screendrop/RecordingStudioExporter.swift
+@@ -1577,7 +1577,7 @@
+             textLayout = cached
+         } else {
+             let font = Self.captionFont(size: metrics.fontSize)
+-    
++
+             let text = NSMutableAttributedString()
+             if !modifierText.isEmpty {
+                 text.append(NSAttributedString(string: modifierText, attributes: [
+@@ -1591,7 +1591,7 @@
+                 NSAttributedString.Key(kCTForegroundColorAttributeName as String):
+                     CGColor(gray: 1, alpha: 1)
+             ]))
+-    
++
+             let line = CTLineCreateWithAttributedString(text)
+             var ascent: CGFloat = 0
+             var descent: CGFloat = 0
+@@ -1674,7 +1674,7 @@
+                 fontSize *= CGFloat(SubtitleBarMetrics.maximumLineCount) / CGFloat(wrappedLines.count)
+             }
+             guard !wrappedLines.isEmpty else { return }
+-    
++
+             var ascent: CGFloat = 0
+             var descent: CGFloat = 0
+             var leading: CGFloat = 0
