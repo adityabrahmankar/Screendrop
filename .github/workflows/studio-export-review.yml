@@ -8,47 +8,80 @@ concurrency:
   group: studio-export-review-${{ github.ref }}
   cancel-in-progress: true
 jobs:
-  source:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-      - name: Archive the exact reviewed sources
-        run: git archive HEAD -o "$RUNNER_TEMP/screendrop-source.tar"
-      - uses: actions/upload-artifact@v4
-        with:
-          name: reviewed-source
-          path: ${{ runner.temp }}/screendrop-source.tar
-          retention-days: 1
   build:
     runs-on: macos-26
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-      - name: Record environment and select Xcode 26.4 when available
+          fetch-depth: 0
+      - name: Environment
         run: |
           if [ -d /Applications/Xcode_26.4.app/Contents/Developer ]; then
             echo 'DEVELOPER_DIR=/Applications/Xcode_26.4.app/Contents/Developer' >> "$GITHUB_ENV"
           fi
-          sw_vers
-          uname -m
-          xcodebuild -version
-          system_profiler SPDisplaysDataType
-      - name: Build Debug without signing
+          mkdir -p "$RUNNER_TEMP/review-results"
+          { sw_vers; uname -m; xcodebuild -version; system_profiler SPDisplaysDataType; } | tee "$RUNNER_TEMP/review-results/environment.txt"
+      - name: Apply exact candidate in working tree only
+        run: |
+          python3 - <<'PY'
+          import base64, gzip, hashlib, os, pathlib
+          parts = sorted(pathlib.Path('ExportReview').glob('candidate-*.b64'))
+          if parts:
+              encoded = ''.join(p.read_text().strip() for p in parts)
+              patch = gzip.decompress(base64.b64decode(encoded, validate=True))
+              assert hashlib.sha256(patch).hexdigest() == '2d0ba04405fb46235721a3521543a6f6e2e5c62f9a09a9752a0d341b925f1cf6'
+              pathlib.Path(os.environ['RUNNER_TEMP'], 'candidate.patch').write_bytes(patch)
+          PY
+          if [ -f "$RUNNER_TEMP/candidate.patch" ]; then
+            git apply --check "$RUNNER_TEMP/candidate.patch"
+            git apply "$RUNNER_TEMP/candidate.patch"
+          fi
+          for fix in ExportReview/hotfix-*.patch; do
+            [ -f "$fix" ] || continue
+            git apply --check "$fix"
+            git apply "$fix"
+          done
+          git diff --check
+          git diff --stat
+      - name: Scheduling and cancellation unit tests
         run: |
           set -o pipefail
-          xcodebuild build -project Screendrop.xcodeproj -scheme Screendrop -configuration Debug -destination 'generic/platform=macOS' -derivedDataPath "$RUNNER_TEMP/StudioDebug" CODE_SIGNING_ALLOWED=NO ARCHS=arm64 ONLY_ACTIVE_ARCH=YES 2>&1 | tee "$RUNNER_TEMP/studio-debug.log"
-      - name: Build Release without signing
+          xcrun swiftc -O -swift-version 6 Screendrop/RecordingClipTimeline.swift Screendrop/StudioExportScheduling.swift ExportReview/SchedulingTests.swift -o "$RUNNER_TEMP/scheduling-tests"
+          "$RUNNER_TEMP/scheduling-tests" | tee "$RUNNER_TEMP/review-results/scheduling-tests.txt"
+      - name: Build candidate Debug
+        run: |
+          status=0
+          xcodebuild build -project Screendrop.xcodeproj -scheme Screendrop -configuration Debug -destination 'generic/platform=macOS' -derivedDataPath "$RUNNER_TEMP/StudioDebug" CODE_SIGNING_ALLOWED=NO ARCHS=arm64 ONLY_ACTIVE_ARCH=YES > "$RUNNER_TEMP/review-results/studio-debug.log" 2>&1 || status=$?
+          grep -E 'error:|warning:|BUILD SUCCEEDED|BUILD FAILED' "$RUNNER_TEMP/review-results/studio-debug.log" | tail -100 || true
+          exit "$status"
+      - name: Build candidate Release
+        run: |
+          status=0
+          xcodebuild build -project Screendrop.xcodeproj -scheme Screendrop -configuration Release -destination 'generic/platform=macOS' -derivedDataPath "$RUNNER_TEMP/StudioRelease" CODE_SIGNING_ALLOWED=NO ARCHS=arm64 ONLY_ACTIVE_ARCH=YES > "$RUNNER_TEMP/review-results/studio-release.log" 2>&1 || status=$?
+          grep -E 'error:|warning:|BUILD SUCCEEDED|BUILD FAILED' "$RUNNER_TEMP/review-results/studio-release.log" | tail -100 || true
+          exit "$status"
+      - name: Build pinned pass1 with probe only
+        run: |
+          git worktree add --detach "$RUNNER_TEMP/pass1" 2e891f6ac625fe10c48d8e0f03506dc575e879b3
+          python3 ExportReview/prepare_baseline.py "$GITHUB_WORKSPACE" "$RUNNER_TEMP/pass1"
+          status=0
+          xcodebuild build -project "$RUNNER_TEMP/pass1/Screendrop.xcodeproj" -scheme Screendrop -configuration Debug -destination 'generic/platform=macOS' -derivedDataPath "$RUNNER_TEMP/StudioBaseline" CODE_SIGNING_ALLOWED=NO ARCHS=arm64 ONLY_ACTIVE_ARCH=YES > "$RUNNER_TEMP/review-results/studio-baseline.log" 2>&1 || status=$?
+          grep -E 'error:|warning:|BUILD SUCCEEDED|BUILD FAILED' "$RUNNER_TEMP/review-results/studio-baseline.log" | tail -100 || true
+          exit "$status"
+      - name: Full-frame parity and real export regression tests
         run: |
           set -o pipefail
-          xcodebuild build -project Screendrop.xcodeproj -scheme Screendrop -configuration Release -destination 'generic/platform=macOS' -derivedDataPath "$RUNNER_TEMP/StudioRelease" CODE_SIGNING_ALLOWED=NO ARCHS=arm64 ONLY_ACTIVE_ARCH=YES 2>&1 | tee "$RUNNER_TEMP/studio-release.log"
+          python3 ExportReview/run_native.py "$RUNNER_TEMP/StudioDebug/Build/Products/Debug/Screendrop.app/Contents/MacOS/Screendrop" "$RUNNER_TEMP/StudioBaseline/Build/Products/Debug/Screendrop.app/Contents/MacOS/Screendrop" "$RUNNER_TEMP/review-results/native" | tee "$RUNNER_TEMP/review-results/native-tests.log"
+      - name: Archive exact tested source
+        if: always()
+        run: |
+          tar -czf "$RUNNER_TEMP/review-results/tested-source.tar.gz" Screendrop ExportReview .github/workflows/studio-export-review.yml
+          git diff --binary > "$RUNNER_TEMP/review-results/tested.patch"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: build-logs
-          path: ${{ runner.temp }}/studio-*.log
-          retention-days: 1
+          name: export-review-results
+          path: ${{ runner.temp }}/review-results
+          retention-days: 7
