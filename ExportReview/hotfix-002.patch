@@ -1,0 +1,106 @@
+--- a/Screendrop/RecordingStudioExporter.swift
++++ b/Screendrop/RecordingStudioExporter.swift
+@@ -467,9 +467,11 @@
+         }
+         // Wake readers immediately. Writer cancellation happens only after
+         // BOTH pumps have exited, so it cannot race a late append.
++        let readerCancellation = StudioExportReaderCancellation(
++            readers: [screenReader] + (capturedReplacementReader.map { [$0] } ?? [])
++        )
+         let ioCancellation = cancelFlag.onFailure {
+-            if screenReader.status == .reading { screenReader.cancelReading() }
+-            if capturedReplacementReader?.status == .reading { capturedReplacementReader?.cancelReading() }
++            readerCancellation.cancel()
+             cameraFeed?.cancel()
+         }
+         defer { cancelFlag.removeHandler(ioCancellation) }
+@@ -621,11 +623,13 @@
+         // A dedicated worker avoids blocking a Swift concurrency worker thread.
+         let queue = DispatchQueue(label: "com.screendrop.studio.export.video", qos: .userInitiated,
+                                   autoreleaseFrequency: .workItem)
++        let io = StudioExportVideoIO(output: output, reader: reader, writer: writer,
++                                     input: input, adaptor: adaptor)
+         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, any Error>) in
+             queue.async {
+                 do {
+-                    try self.pumpVideoOnWorker(output: output, reader: reader, writer: writer,
+-                        input: input, adaptor: adaptor, compositor: compositor, cameraFeed: cameraFeed,
++                    try self.pumpVideoOnWorker(output: io.output, reader: io.reader, writer: io.writer,
++                        input: io.input, adaptor: io.adaptor, compositor: compositor, cameraFeed: cameraFeed,
+                         clipTimeline: clipTimeline, cancelFlag: cancelFlag,
+                         benchmark: benchmark, progress: progress)
+                     continuation.resume()
+@@ -821,10 +825,11 @@
+         guard let output, let input else { return }
+         let queue = DispatchQueue(label: "com.screendrop.studio.export.audio", qos: .userInitiated,
+                                   autoreleaseFrequency: .workItem)
++        let io = StudioExportAudioIO(output: output, reader: reader, writer: writer, input: input)
+         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, any Error>) in
+             queue.async {
+                 let wake = StudioExportWakeSignal()
+-                let observation = input.observe(\.isReadyForMoreMediaData, options: [.new]) { _, _ in wake.signal() }
++                let observation = io.input.observe(\.isReadyForMoreMediaData, options: [.new]) { _, _ in wake.signal() }
+                 let cancellation = cancelFlag.onFailure { wake.signal() }
+                 defer {
+                     observation.invalidate()
+@@ -835,16 +840,16 @@
+                         try cancelFlag.check()
+                         // Discover EOF before waiting for readiness. Otherwise
+                         // an exhausted audio track can stall video interleaving.
+-                        guard let sample = output.copyNextSampleBuffer() else {
+-                            try Self.checkReader(reader, control: cancelFlag)
++                        guard let sample = io.output.copyNextSampleBuffer() else {
++                            try Self.checkReader(io.reader, control: cancelFlag)
+                             return false
+                         }
+-                        try Self.waitForWriter(input, writer: writer, control: cancelFlag, wake: wake)
++                        try Self.waitForWriter(io.input, writer: io.writer, control: cancelFlag, wake: wake)
+                         try cancelFlag.check()
+-                        guard input.append(sample) else { throw ExportError.writerFailed(writer.error) }
++                        guard io.input.append(sample) else { throw ExportError.writerFailed(io.writer.error) }
+                         return true
+                     }) {}
+-                    input.markAsFinished()
++                    io.input.markAsFinished()
+                     continuation.resume()
+                 } catch {
+                     cancelFlag.fail(error)
+@@ -915,6 +920,38 @@
+         case .low: factor = 1.25
+         }
+         return max(2_500_000, Int(Double(width * height) * factor))
++    }
++}
++
++// MARK: - Legacy AVFoundation worker ownership
++
++/// AVFoundation's legacy writer/reader types lack Sendable conformances.
++/// These narrowly scoped handles document the manual ownership contract:
++/// each output and writer input has exactly one dedicated worker. Shared
++/// reader cancellation/status and writer status are the only cross-worker
++/// operations. Finalization starts only after both workers have returned.
++/// The boxes do NOT make arbitrary concurrent append/read operations safe.
++nonisolated private struct StudioExportVideoIO: @unchecked Sendable {
++    let output: AVAssetReaderTrackOutput
++    let reader: AVAssetReader
++    let writer: AVAssetWriter
++    let input: AVAssetWriterInput
++    let adaptor: AVAssetWriterInputPixelBufferAdaptor
++}
++
++nonisolated private struct StudioExportAudioIO: @unchecked Sendable {
++    let output: AVAssetReaderAudioMixOutput
++    let reader: AVAssetReader
++    let writer: AVAssetWriter
++    let input: AVAssetWriterInput
++}
++
++/// Cancellation deliberately crosses the reader workers; it never consumes
++/// a sample or mutates their cursor state. Keep this exception explicit.
++nonisolated private struct StudioExportReaderCancellation: @unchecked Sendable {
++    let readers: [AVAssetReader]
++    func cancel() {
++        for reader in readers where reader.status == .reading { reader.cancelReading() }
+     }
+ }
+ 
