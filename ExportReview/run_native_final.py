@@ -6,6 +6,8 @@ All subprocesses have deadlines. This script never opens a user's recordings.
 """
 from __future__ import annotations
 import json
+import array
+import math
 import os
 from pathlib import Path
 import statistics
@@ -25,6 +27,8 @@ reports: list[dict] = []
 matched = 0
 audio_matched = 0
 audio_tail_variations: list[dict] = []
+audio_reference_variants: list[dict] = []
+audio_variant_matches: list[dict] = []
 
 def metrics(log: str) -> dict:
     values = {}
@@ -115,7 +119,17 @@ def compare(mode: str, backend: str = 'metal', depth: str = '3'):
     assert (old/'audio.json').exists() == (new/'audio.json').exists(), f'{suffix}: audio disappeared'
     if (old/'audio.json').exists():
         old_audio, new_audio = (json.loads((x/'audio.json').read_text()) for x in (old,new))
-        assert old_audio['in_timeline'] == new_audio['in_timeline'], f'{suffix}: in-cut PCM or audio timing changed: {old_audio} vs {new_audio}'
+        if old_audio['in_timeline'] != new_audio['in_timeline']:
+            # These fixtures have identical source audio, clip edits and settings;
+            # only their video/overlay/container configuration differs. The fixed
+            # baseline-only repeatability corpus is collected BEFORE candidates.
+            same_audio_edits = mode in ('all', 'plain', 'crop', 'portrait', 'fit',
+                'wallpaper', 'hevc', 'mov', 'no-overlays', 'camera-hidden', '4k')
+            matches = [i for i, variant in enumerate(audio_reference_variants)
+                       if variant == new_audio['in_timeline']] if same_audio_edits else []
+            assert matches, f'{suffix}: PCM/timing is not byte-exact to any observed independent baseline: {old_audio} vs {new_audio}'
+            audio_variant_matches.append(dict(case=suffix, exact_baseline_variant=matches[0],
+                reason='Independent baseline itself produces more than one PCM realization'))
         if old_audio['full_stream'] != new_audio['full_stream']:
             audio_tail_variations.append(dict(case=suffix, baseline=old_audio, candidate=new_audio))
         audio_matched += 1
@@ -124,8 +138,39 @@ def compare(mode: str, backend: str = 'metal', depth: str = '3'):
             for movie in folder.glob('export.*'): movie.unlink()
 
 run(candidate, 'prepare', 'prepare', digest=False)
+# Measure repeatability before evaluating the candidate. Do not invent a numeric
+# quality tolerance or repeatedly rerun until the candidate happens to match.
+reference_folders = []
+for iteration in range(8):
+    folder = run(baseline, 'all', f'baseline-repeatability-{iteration}', depth='1', reuse='0', cache='0')
+    audio = json.loads((folder/'audio.json').read_text())['in_timeline']
+    if audio not in audio_reference_variants:
+        audio_reference_variants.append(audio)
+        reference_folders.append(folder)
+    for movie in folder.glob('export.*'): movie.unlink()
+repeatability_differences = []
+for folder in reference_folders[1:]:
+    for plane in sorted(reference_folders[0].glob('audio.plane*.pcm')):
+        other = folder / plane.name
+        a, b = array.array('f'), array.array('f')
+        a.frombytes(plane.read_bytes()); b.frombytes(other.read_bytes())
+        if sys.byteorder != 'little':
+            a.byteswap(); b.byteswap()
+        assert len(a) == len(b), 'Baseline in-cut sample count is not repeatable'
+        changed = [i for i, (x, y) in enumerate(zip(a, b)) if x != y]
+        squared_error = sum((x-y)**2 for x,y in zip(a,b))
+        energy = sum(x*x for x in a)
+        repeatability_differences.append(dict(reference=str(reference_folders[0].name),
+            alternate=str(folder.name), plane=plane.name, changed_scalar_samples=len(changed),
+            first_changed_scalar=changed[0] if changed else None,
+            last_changed_scalar=changed[-1] if changed else None,
+            peak_absolute_difference=max((abs(x-y) for x,y in zip(a,b)), default=0),
+            snr_db=10*math.log10(energy/squared_error) if squared_error and energy else None))
+(out/'baseline-repeatability.json').write_text(json.dumps(dict(runs=8,
+    variants=audio_reference_variants, differences=repeatability_differences), indent=2))
+print(f'Baseline-only audio repeatability: {len(audio_reference_variants)} distinct in-cut PCM realizations across 8 exports', flush=True)
 cases = ('all', 'plain', 'crop', 'portrait', 'fit', 'wallpaper', 'hevc', 'mov', 'mute',
-         'replacement', 'static', 'no-overlays', 'camera-hidden', '4k')
+         'replacement', 'static', 'no-overlays', 'camera-hidden', '4k', 'audio-unretimed')
 for mode in cases:
     compare(mode)
 for mode in ('all', 'crop', 'static'):
@@ -149,6 +194,8 @@ if os.environ.get('SCREENDROP_RUN_SOAK') == '1':
     for movie in folder.glob('export.*'): movie.unlink()
 summary = dict(matched_raw_frames=matched, matched_pcm_cases=audio_matched,
                reference='pass1 2e891f6; identical fixture entry point + observation probes only',
-               cases=list(cases), reports=reports, out_of_cut_audio_tail_variations=audio_tail_variations)
+               cases=list(cases), reports=reports, out_of_cut_audio_tail_variations=audio_tail_variations,
+               baseline_audio_repeatability=dict(runs=8, variants=audio_reference_variants,
+                   differences=repeatability_differences), exact_audio_variant_matches=audio_variant_matches)
 (out/'summary.json').write_text(json.dumps(summary, indent=2, sort_keys=True))
-print(f'PASS: {matched} complete-frame hashes equal; {audio_matched} exact in-cut PCM comparisons; PTS/readback; cancellation/faults', flush=True)
+print(f'PASS: {matched} complete-frame hashes equal; {audio_matched} in-cut PCM matches to observed baseline realizations; PTS/readback; cancellation/faults', flush=True)
