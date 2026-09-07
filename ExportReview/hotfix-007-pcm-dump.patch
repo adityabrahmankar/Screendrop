@@ -1,0 +1,57 @@
+--- a/Screendrop/StudioExportReview.swift
++++ b/Screendrop/StudioExportReview.swift
+@@ -53,6 +53,7 @@
+     private var fullBytes: Int64 = 0
+     private var firstTime: CMTime?
+     private var lastEnd = CMTime.zero
++    private var planeFiles: [FileHandle] = []
+     private var planeHashes: [SHA256] = []
+     private var planeChannels: [Int] = []
+     private var validSamples: Int64 = 0
+@@ -127,6 +128,13 @@
+         if planeHashes.isEmpty {
+             planeHashes = buffers.map { _ in SHA256() }
+             planeChannels = channels
++            for plane in buffers.indices {
++                let path = url.deletingPathExtension().appendingPathExtension("plane\(plane).pcm")
++                guard FileManager.default.createFile(atPath: path.path, contents: nil) else {
++                    throw NSError(domain: "ExportReview.AudioWrite", code: 1)
++                }
++                planeFiles.append(try FileHandle(forWritingTo: path))
++            }
+         }
+         guard planeChannels == channels else { throw NSError(domain: "ExportReview.AudioFormat", code: 3) }
+         let validCount = upper - lower
+@@ -136,8 +144,10 @@
+             guard let data = buffer.mData, Int(buffer.mDataByteSize) >= upper * stride else {
+                 throw NSError(domain: "ExportReview.Audio", code: 3)
+             }
+-            planeHashes[plane].update(data: Data(bytesNoCopy: data.advanced(by: lower * stride),
+-                count: validCount * stride, deallocator: .none))
++            let bytes = Data(bytesNoCopy: data.advanced(by: lower * stride),
++                count: validCount * stride, deallocator: .none)
++            planeHashes[plane].update(data: bytes)
++            try planeFiles[plane].write(contentsOf: bytes)
+             validBytes += Int64(validCount * stride)
+         }
+         withExtendedLifetime(retained) {}
+@@ -151,6 +161,8 @@
+     }
+ 
+     func finish() throws {
++        for file in planeFiles { try file.close() }
++        planeFiles.removeAll()
+         let full: [String: Any] = ["sha256": fullHash.finalize().map { String(format: "%02x", $0) }.joined(),
+             "samples": fullSamples, "bytes": fullBytes,
+             "first_seconds": firstTime?.seconds ?? 0, "end_seconds": lastEnd.seconds]
+--- a/Screendrop/StudioExportReview.swift
++++ b/Screendrop/StudioExportReview.swift
+@@ -278,7 +278,7 @@
+         let bench = mode == "benchmark" || mode == "cancel" || mode == "cancel-immediate"
+         let still = mode == "static" || bench || soak
+         let full = !still
+-        let clips = dynamicBench ? RecordingClipTimeline(segments: [RecordingClipSegment(sourceStart: 0, sourceEnd: 10)]) : still ? RecordingClipTimeline(segments: [RecordingClipSegment(sourceStart: 0, sourceEnd: soak ? 3600 : (bench ? 30 : 4))])
++        let clips = mode == "audio-unretimed" ? RecordingClipTimeline(segments: [RecordingClipSegment(sourceStart: 0, sourceEnd: 4)]) : dynamicBench ? RecordingClipTimeline(segments: [RecordingClipSegment(sourceStart: 0, sourceEnd: 10)]) : still ? RecordingClipTimeline(segments: [RecordingClipSegment(sourceStart: 0, sourceEnd: soak ? 3600 : (bench ? 30 : 4))])
+             : RecordingClipTimeline(segments: [RecordingClipSegment(sourceStart: 0.25, sourceEnd: 2.25),
+                                               RecordingClipSegment(sourceStart: 2.7, sourceEnd: 3.9, speed: 2)])
+         var capture = PointerCaptureFile()
