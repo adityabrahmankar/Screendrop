@@ -1,0 +1,15 @@
+--- a/Screendrop/StudioExportReview.swift
++++ b/Screendrop/StudioExportReview.swift
+@@ -297,7 +297,11 @@
+         while try autoreleasepool(invoking: { () throws -> Bool in
+             guard let sample = output.copyNextSampleBuffer() else { return false }
+             let time = CMSampleBufferGetPresentationTimeStamp(sample).seconds
+-            try require(abs(time - Double(frames) / 60) < 0.001, "PTS drift at frame \(frames): \(time)")
++            // Match the established writer's actual CMTime conversion. Core
++            // Media can truncate a floating-point value by one 600-timescale
++            // tick (pass1 frame 11 is 109/600, not 110/600).
++            let expectedTime = CMTime(seconds: Double(frames) / 60, preferredTimescale: 600).seconds
++            try require(abs(time - expectedTime) < 0.000_001, "PTS drift at frame \(frames): \(time) vs \(expectedTime)")
+             frames += 1
+             return true
+         }) {}
