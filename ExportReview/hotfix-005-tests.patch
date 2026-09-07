@@ -1,0 +1,221 @@
+--- a/Screendrop/StudioExportReview.swift
++++ b/Screendrop/StudioExportReview.swift
+@@ -39,6 +39,63 @@
+     }
+ }
+ 
++/// Streams the exact uncompressed audio submitted to AAC. Container padding
++/// may differ, but editing, replacement timing and PCM content must not.
++nonisolated final class StudioExportAudioProbe {
++    private let url: URL
++    private var hash = SHA256()
++    private var sampleCount: Int64 = 0
++    private var byteCount: Int64 = 0
++    private var firstTime: CMTime?
++    private var lastEnd = CMTime.zero
++
++    static func make() throws -> StudioExportAudioProbe? {
++        guard let path = ProcessInfo.processInfo.environment["SCREENDROP_STUDIO_EXPORT_AUDIO_DIGEST"], !path.isEmpty else { return nil }
++        return StudioExportAudioProbe(url: URL(fileURLWithPath: path))
++    }
++    private init(url: URL) { self.url = url }
++    func record(_ sample: CMSampleBuffer) throws {
++        guard let block = CMSampleBufferGetDataBuffer(sample) else {
++            throw NSError(domain: "ExportReview.Audio", code: 1)
++        }
++        let count = CMBlockBufferGetDataLength(block)
++        var bytes = Data(count: count)
++        if count > 0 {
++            let status = bytes.withUnsafeMutableBytes { raw -> OSStatus in
++                guard let base = raw.baseAddress else { return -1 }
++                return CMBlockBufferCopyDataBytes(block, atOffset: 0, dataLength: count, destination: base)
++            }
++            guard status == kCMBlockBufferNoErr else { throw NSError(domain: "ExportReview.Audio", code: Int(status)) }
++        }
++        hash.update(data: bytes)
++        byteCount += Int64(count)
++        sampleCount += Int64(CMSampleBufferGetNumSamples(sample))
++        let time = CMSampleBufferGetPresentationTimeStamp(sample)
++        if firstTime == nil { firstTime = time }
++        lastEnd = CMTimeAdd(time, CMSampleBufferGetDuration(sample))
++    }
++    func finish() throws {
++        let result: [String: Any] = ["sha256": hash.finalize().map { String(format: "%02x", $0) }.joined(),
++                                   "samples": sampleCount, "bytes": byteCount,
++                                   "first_seconds": firstTime?.seconds ?? 0, "end_seconds": lastEnd.seconds]
++        try JSONSerialization.data(withJSONObject: result, options: [.sortedKeys, .prettyPrinted]).write(to: url)
++    }
++}
++
++/// Faults exist only in DEBUG/validation builds and require explicit opt-in.
++/// They exercise sibling wakeup and cleanup after the real writer has started.
++nonisolated enum StudioExportReviewFault {
++    static func shouldFail(_ stage: String, ordinal: Int) -> Bool {
++        ordinal >= 5 && ProcessInfo.processInfo.environment["SCREENDROP_EXPORT_REVIEW_FAULT"] == stage
++    }
++    static func check(_ stage: String, ordinal: Int) throws {
++        if shouldFail(stage, ordinal: ordinal) {
++            throw NSError(domain: "ExportReview.Injected", code: 5,
++                          userInfo: [NSLocalizedDescriptionKey: "Injected \(stage) pump failure"])
++        }
++    }
++}
++
+ /// Runs in a separate app process for each case: environment switches cannot
+ /// race a concurrent export. Fixture generation never requests capture access.
+ @MainActor enum StudioExportReview {
+@@ -60,6 +117,12 @@
+         let result = URL(fileURLWithPath: env["SCREENDROP_EXPORT_REVIEW_RESULT"] ?? path, isDirectory: true)
+         try FileManager.default.createDirectory(at: result, withIntermediateDirectories: true)
+         let config = configuration(root, mode: mode)
++        let temporary = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("Screendrop/StudioExports")
++        let before = Set((try? FileManager.default.contentsOfDirectory(atPath: temporary.path)) ?? [])
++        func verifyCleanup() throws {
++            let after = Set((try? FileManager.default.contentsOfDirectory(atPath: temporary.path)) ?? [])
++            try require(after.subtracting(before).isEmpty, "failed export leaked a temporary output")
++        }
+         let start = ProcessInfo.processInfo.systemUptime
+         if mode == "cancel" || mode == "cancel-immediate" {
+             let task = Task { try await RecordingStudioExporter().export(config, progress: { _ in }) }
+@@ -70,9 +133,22 @@
+                 try? FileManager.default.removeItem(at: url)
+                 throw Failure.assertion("cancelled export returned success")
+             } catch is CancellationError {
+-                print("PASS: cancellation propagated")
++                try verifyCleanup()
++                print("PASS: cancellation propagated; temporary output removed")
+             }
+             return
++        }
++        if mode.hasPrefix("fail-") {
++            do {
++                let url = try await RecordingStudioExporter().export(config, progress: { _ in })
++                try? FileManager.default.removeItem(at: url)
++                throw Failure.assertion("injected failure returned success")
++            } catch let error as Failure { throw error }
++            catch {
++                try verifyCleanup()
++                print("PASS: \(mode) terminated both pumps and removed temporary output: \(error)")
++                return
++            }
+         }
+         if mode == "invalid" {
+             do {
+@@ -103,10 +179,12 @@
+     }
+ 
+     private static func configuration(_ root: URL, mode: String) -> RecordingStudioExporter.Configuration {
++        let soak = mode == "soak"
++        let dynamicBench = mode == "benchmark-dynamic"
+         let bench = mode == "benchmark" || mode == "cancel" || mode == "cancel-immediate"
+-        let still = mode == "static" || bench
++        let still = mode == "static" || bench || soak
+         let full = !still
+-        let clips = still ? RecordingClipTimeline(segments: [RecordingClipSegment(sourceStart: 0, sourceEnd: bench ? 30 : 4)])
++        let clips = dynamicBench ? RecordingClipTimeline(segments: [RecordingClipSegment(sourceStart: 0, sourceEnd: 10)]) : still ? RecordingClipTimeline(segments: [RecordingClipSegment(sourceStart: 0, sourceEnd: soak ? 3600 : (bench ? 30 : 4))])
+             : RecordingClipTimeline(segments: [RecordingClipSegment(sourceStart: 0.25, sourceEnd: 2.25),
+                                               RecordingClipSegment(sourceStart: 2.7, sourceEnd: 3.9, speed: 2)])
+         var capture = PointerCaptureFile()
+@@ -144,9 +222,9 @@
+                      RecordingTranscriptWord(text: "日本語, ", start: 3.4, end: 3.65),
+                      RecordingTranscriptWord(text: "42.", start: 3.65, end: 3.9)]
+         let portrait = mode == "portrait" || mode == "fit"
+-        let size = bench ? CGSize(width: 1920, height: 1080) : (portrait ? CGSize(width: 360, height: 640) : CGSize(width: 960, height: 540))
++        let size = soak ? CGSize(width: 160, height: 90) : (mode == "4k" ? CGSize(width: 3840, height: 2160) : (bench || dynamicBench ? CGSize(width: 1920, height: 1080) : (portrait ? CGSize(width: 360, height: 640) : CGSize(width: 960, height: 540))))
+         var style = RecordingStudioStyle()
+-        style.camera.isVisible = full
++        style.camera.isVisible = full && mode != "camera-hidden" && mode != "no-overlays"
+         style.camera.size = 0.25
+         style.camera.center = CGPoint(x: 0.82, y: 0.73)
+         style.camera.roundness = 0.5
+@@ -161,17 +239,18 @@
+                 sourceSize: CGSize(width: 960, height: 540), viewportTimeline: viewport,
+                 duration: clips.duration, focus: { pointer?.location(at: $0) }) : nil
+         return RecordingStudioExporter.Configuration(
+-            screenURL: root.appendingPathComponent(mode == "invalid" ? "missing.mov" : (still ? "static.mov" : "source.mov")),
+-            cameraURL: full ? root.appendingPathComponent("camera.mov") : nil,
+-            cameraOffset: 0.17, style: style, viewportTimeline: viewport, pointerTimeline: pointer,
+-            showsPressEffects: full, keystrokeTimeline: full ? KeystrokeCaptionTimeline(events: capture.keystrokes) : nil,
+-            keystrokePlacement: .bottomLeft, subtitleTimeline: full ? SubtitleTimeline(cues: subtitles) : nil,
++            screenURL: root.appendingPathComponent(mode == "invalid" ? "missing.mov" :
++                (soak ? "soak.mov" : (dynamicBench ? "dense-source.mov" : (still ? "static.mov" : "source.mov")))),
++            cameraURL: full && mode != "no-overlays" ? root.appendingPathComponent(dynamicBench ? "dense-camera.mov" : "camera.mov") : nil,
++            cameraOffset: 0.17, style: style, viewportTimeline: viewport, pointerTimeline: mode == "no-overlays" ? nil : pointer,
++            showsPressEffects: full, keystrokeTimeline: full && mode != "no-overlays" ? KeystrokeCaptionTimeline(events: capture.keystrokes) : nil,
++            keystrokePlacement: .bottomLeft, subtitleTimeline: full && mode != "no-overlays" ? SubtitleTimeline(cues: subtitles) : nil,
+             subtitleStyle: SubtitleBarStyle(verticalPosition: 0.6, fontScale: 1.1, highlightsSpokenWord: mode != "plain"),
+             karaokeTimeline: full ? KaraokeTimeline(cues: subtitles, words: words) : nil,
+             canvasSize: size,
+             videoCropRect: mode == "crop" ? CGRect(x: 0.1, y: 0.12, width: 0.75, height: 0.7) : CGRect(x: 0, y: 0, width: 1, height: 1),
+             clipTimeline: clips, exportSettings: settings,
+-            audioReplacementURL: mode == "replacement" ? root.appendingPathComponent("replacement.wav") : nil,
++            audioReplacementURL: mode == "replacement" ? root.appendingPathComponent("replacement.wav") : (dynamicBench ? root.appendingPathComponent("audio.wav") : nil),
+             reframe: reframe, fitContentAspect: mode == "fit" ? 16.0 / 9.0 : nil)
+     }
+ 
+@@ -179,6 +258,9 @@
+         try await movie(root.appendingPathComponent("screen.mov"), width: 960, height: 540, duration: 4, step: 0.25)
+         try await movie(root.appendingPathComponent("camera.mov"), width: 320, height: 240, duration: 4, step: 1.0 / 15)
+         try await movie(root.appendingPathComponent("static.mov"), width: 960, height: 540, duration: 30, step: 30)
++        try await movie(root.appendingPathComponent("soak.mov"), width: 160, height: 90, duration: 3600, step: 1)
++        try await movie(root.appendingPathComponent("dense-source.mov"), width: 960, height: 540, duration: 10, step: 1.0 / 60)
++        try await movie(root.appendingPathComponent("dense-camera.mov"), width: 320, height: 240, duration: 10, step: 1.0 / 30)
+         try wav(root.appendingPathComponent("audio.wav"), duration: 4, frequency: 440)
+         try wav(root.appendingPathComponent("replacement.wav"), duration: 1.5, frequency: 660)
+         let composition = AVMutableComposition()
+@@ -314,7 +396,11 @@
+             let audioReader = try AVAssetReader(asset: asset)
+             let audioOutput = AVAssetReaderTrackOutput(track: audioTrack, outputSettings: [AVFormatIDKey: kAudioFormatLinearPCM])
+             audioReader.add(audioOutput); try require(audioReader.startReading(), "audio readback did not start")
+-            while let sample = audioOutput.copyNextSampleBuffer() { audioFrames += Int64(CMSampleBufferGetNumSamples(sample)) }
++            while autoreleasepool(invoking: { () -> Bool in
++                guard let sample = audioOutput.copyNextSampleBuffer() else { return false }
++                audioFrames += Int64(CMSampleBufferGetNumSamples(sample))
++                return true
++            }) {}
+             try require(audioReader.status == .completed && audioFrames > 0, "audio decoding failed")
+         }
+         return ["frames": frames, "duration_seconds": actualDuration, "audio_tracks": audioTracks.count,
+--- a/ExportReview/SchedulingTests.swift
++++ b/ExportReview/SchedulingTests.swift
+@@ -58,6 +58,21 @@
+             comparisons += 1
+         }
+ 
++        for requested in [-1, 0, 1, 2, 3, 100] {
++            let expected = min(3, max(1, requested))
++            try require(StudioExportPipelineOptions.resolvedDepth(requested: requested, width: 1920, height: 1080) == expected, "1080p depth")
++            try require(StudioExportPipelineOptions.resolvedDepth(requested: requested, width: 3840, height: 2160) == expected, "4K depth")
++            try require(StudioExportPipelineOptions.resolvedDepth(requested: requested, width: 7680, height: 4320) == 1, "8K depth")
++        }
++        try require(StudioExportPipelineOptions.resolvedDepth(requested: 3, width: Int.max, height: Int.max) == 1, "overflow depth")
++        try require(StudioExportPipelineOptions.resolvedDepth(requested: 3, width: 0, height: 0) == 1, "invalid dimensions")
++        var gate = StudioExportProgressGate()
++        try require(gate.shouldReport(0, at: 1), "initial progress")
++        try require(!gate.shouldReport(0.1, at: 1.05), "progress rate limit")
++        try require(gate.shouldReport(0.2, at: 1.11), "progress after interval")
++        try require(!gate.shouldReport(0.15, at: 2), "regressing progress")
++        try require(!gate.shouldReport(.nan, at: 2), "nonfinite progress")
++
+         let control = StudioExportControl()
+         let calls = LockedValue(0)
+         let removed = control.onFailure { calls.update { $0 += 1000 } }
+--- a/ExportReview/prepare_baseline.py
++++ b/ExportReview/prepare_baseline.py
+@@ -22,3 +22,16 @@
+ s = s.replace('            if !adaptor.append(destinationBuffer, withPresentationTime: pts) {',
+               '            #if DEBUG\n            try frameProbe?.record(destinationBuffer, index: frame, time: pts)\n            #endif\n            if !adaptor.append(destinationBuffer, withPresentationTime: pts) {', 1)
+ p.write_text(s)
++
++# Audio probes observe bytes/timestamps without changing baseline scheduling.
++s = p.read_text()
++s = s.replace('        while let sampleBuffer = output.copyNextSampleBuffer() {\n            if cancelFlag.isCancelled',
++              '        #if DEBUG\n        let audioProbe = try StudioExportAudioProbe.make()\n        #endif\n        while let sampleBuffer = output.copyNextSampleBuffer() {\n            if cancelFlag.isCancelled', 1)
++s = s.replace('            if !input.append(sampleBuffer) {',
++              '            #if DEBUG\n            try audioProbe?.record(sampleBuffer)\n            #endif\n            if !input.append(sampleBuffer) {', 1)
++# The audio pump is the last occurrence before the output helpers.
++pos = s.index('    private func pumpAudio(')
++audio = s[pos:].replace('        input.markAsFinished()',
++                       '        #if DEBUG\n        try audioProbe?.finish()\n        #endif\n        input.markAsFinished()', 1)
++s = s[:pos] + audio
++p.write_text(s)
