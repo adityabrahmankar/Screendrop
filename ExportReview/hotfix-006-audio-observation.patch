@@ -1,0 +1,192 @@
+--- a/Screendrop/RecordingStudioExporter.swift
++++ b/Screendrop/RecordingStudioExporter.swift
+@@ -870,7 +870,7 @@
+                 }
+                 do {
+                     #if DEBUG
+-                    let audioProbe = try StudioExportAudioProbe.make()
++                    let audioProbe = try StudioExportAudioProbe.make(validating: io.reader.timeRange)
+                     var audioOrdinal = 0
+                     #endif
+                     while try autoreleasepool(invoking: { () throws -> Bool in
+--- a/Screendrop/StudioExportReview.swift
++++ b/Screendrop/StudioExportReview.swift
+@@ -1,6 +1,8 @@
+ // Opt-in native export regression fixtures. No production code or user media.
+ #if DEBUG
+ import AppKit
++import AudioToolbox
++import CoreMedia
+ import AVFoundation
+ import CoreGraphics
+ import CoreText
+@@ -39,45 +41,125 @@
+     }
+ }
+ 
+-/// Streams the exact uncompressed audio submitted to AAC. Container padding
+-/// may differ, but editing, replacement timing and PCM content must not.
++/// Compare PCM only inside the declared reader time range, sample-exactly.
++/// AVAssetReader may return a final buffer extending beyond that range. Keep
++/// the full-stream digest as evidence, but do not confuse an out-of-cut tail
++/// with different edited audio. This probe never modifies writer input.
+ nonisolated final class StudioExportAudioProbe {
+     private let url: URL
+-    private var hash = SHA256()
+-    private var sampleCount: Int64 = 0
+-    private var byteCount: Int64 = 0
++    private let range: CMTimeRange
++    private var fullHash = SHA256()
++    private var fullSamples: Int64 = 0
++    private var fullBytes: Int64 = 0
+     private var firstTime: CMTime?
+     private var lastEnd = CMTime.zero
+-
+-    static func make() throws -> StudioExportAudioProbe? {
++    private var planeHashes: [SHA256] = []
++    private var planeChannels: [Int] = []
++    private var validSamples: Int64 = 0
++    private var validBytes: Int64 = 0
++    private var clockRuns: [[Int64]] = []
++    private var format: [String: Double] = [:]
++
++    static func make(validating range: CMTimeRange) throws -> StudioExportAudioProbe? {
+         guard let path = ProcessInfo.processInfo.environment["SCREENDROP_STUDIO_EXPORT_AUDIO_DIGEST"], !path.isEmpty else { return nil }
+-        return StudioExportAudioProbe(url: URL(fileURLWithPath: path))
+-    }
+-    private init(url: URL) { self.url = url }
++        return StudioExportAudioProbe(url: URL(fileURLWithPath: path), range: range)
++    }
++    private init(url: URL, range: CMTimeRange) { self.url = url; self.range = range }
++
+     func record(_ sample: CMSampleBuffer) throws {
+-        guard let block = CMSampleBufferGetDataBuffer(sample) else {
+-            throw NSError(domain: "ExportReview.Audio", code: 1)
++        guard let block = CMSampleBufferGetDataBuffer(sample),
++              let description = CMSampleBufferGetFormatDescription(sample),
++              let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(description)?.pointee,
++              asbd.mFormatID == kAudioFormatLinearPCM,
++              asbd.mSampleRate > 0, asbd.mSampleRate < Double(Int32.max),
++              asbd.mSampleRate.rounded() == asbd.mSampleRate else {
++            throw NSError(domain: "ExportReview.AudioFormat", code: 1)
+         }
+         let count = CMBlockBufferGetDataLength(block)
+-        var bytes = Data(count: count)
++        var full = Data(count: count)
+         if count > 0 {
+-            let status = bytes.withUnsafeMutableBytes { raw -> OSStatus in
++            let status = full.withUnsafeMutableBytes { raw -> OSStatus in
+                 guard let base = raw.baseAddress else { return -1 }
+                 return CMBlockBufferCopyDataBytes(block, atOffset: 0, dataLength: count, destination: base)
+             }
+             guard status == kCMBlockBufferNoErr else { throw NSError(domain: "ExportReview.Audio", code: Int(status)) }
+         }
+-        hash.update(data: bytes)
+-        byteCount += Int64(count)
+-        sampleCount += Int64(CMSampleBufferGetNumSamples(sample))
++        fullHash.update(data: full)
++        let sampleCount = CMSampleBufferGetNumSamples(sample)
++        fullBytes += Int64(count)
++        fullSamples += Int64(sampleCount)
+         let time = CMSampleBufferGetPresentationTimeStamp(sample)
+         if firstTime == nil { firstTime = time }
+         lastEnd = CMTimeAdd(time, CMSampleBufferGetDuration(sample))
+-    }
++
++        let rate = CMTimeScale(asbd.mSampleRate)
++        func index(at limit: CMTime) -> Int {
++            let delta = CMTimeSubtract(limit, time)
++            let frames = CMTimeConvertScale(delta, timescale: rate, method: .roundTowardPositiveInfinity)
++            return min(sampleCount, max(0, Int(frames.value)))
++        }
++        let lower = index(at: range.start)
++        let upper = index(at: CMTimeRangeGetEnd(range))
++        guard upper > lower else { return }
++        let currentFormat: [String: Double] = ["rate": asbd.mSampleRate,
++            "flags": Double(asbd.mFormatFlags), "bits": Double(asbd.mBitsPerChannel),
++            "channels": Double(asbd.mChannelsPerFrame), "bytes_per_frame": Double(asbd.mBytesPerFrame)]
++        guard format.isEmpty || format == currentFormat else { throw NSError(domain: "ExportReview.AudioFormat", code: 2) }
++        format = currentFormat
++
++        var needed = 0
++        var retained: CMBlockBuffer?
++        _ = CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(sample,
++            bufferListSizeNeededOut: &needed, bufferListOut: nil, bufferListSize: 0,
++            blockBufferAllocator: kCFAllocatorDefault, blockBufferMemoryAllocator: kCFAllocatorDefault,
++            flags: 0, blockBufferOut: &retained)
++        guard needed >= MemoryLayout<AudioBufferList>.size else { throw NSError(domain: "ExportReview.Audio", code: 2) }
++        let storage = UnsafeMutableRawPointer.allocate(byteCount: needed, alignment: MemoryLayout<AudioBufferList>.alignment)
++        defer { storage.deallocate() }
++        let list = storage.bindMemory(to: AudioBufferList.self, capacity: 1)
++        let status = CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(sample,
++            bufferListSizeNeededOut: nil, bufferListOut: list, bufferListSize: needed,
++            blockBufferAllocator: kCFAllocatorDefault, blockBufferMemoryAllocator: kCFAllocatorDefault,
++            flags: 0, blockBufferOut: &retained)
++        guard status == noErr else { throw NSError(domain: "ExportReview.Audio", code: Int(status)) }
++        let buffers = UnsafeMutableAudioBufferListPointer(list)
++        let channels = buffers.map { Int($0.mNumberChannels) }
++        if planeHashes.isEmpty {
++            planeHashes = buffers.map { _ in SHA256() }
++            planeChannels = channels
++        }
++        guard planeChannels == channels else { throw NSError(domain: "ExportReview.AudioFormat", code: 3) }
++        let validCount = upper - lower
++        let stride = Int(asbd.mBytesPerFrame)
++        guard stride > 0 else { throw NSError(domain: "ExportReview.AudioFormat", code: 4) }
++        for (plane, buffer) in buffers.enumerated() {
++            guard let data = buffer.mData, Int(buffer.mDataByteSize) >= upper * stride else {
++                throw NSError(domain: "ExportReview.Audio", code: 3)
++            }
++            planeHashes[plane].update(data: Data(bytesNoCopy: data.advanced(by: lower * stride),
++                count: validCount * stride, deallocator: .none))
++            validBytes += Int64(validCount * stride)
++        }
++        withExtendedLifetime(retained) {}
++        let firstTick = CMTimeConvertScale(time, timescale: rate, method: .roundHalfAwayFromZero).value + Int64(lower)
++        if let last = clockRuns.last, last[0] + last[1] == firstTick {
++            clockRuns[clockRuns.count - 1][1] += Int64(validCount)
++        } else {
++            clockRuns.append([firstTick, Int64(validCount)])
++        }
++        validSamples += Int64(validCount)
++    }
++
+     func finish() throws {
+-        let result: [String: Any] = ["sha256": hash.finalize().map { String(format: "%02x", $0) }.joined(),
+-                                   "samples": sampleCount, "bytes": byteCount,
+-                                   "first_seconds": firstTime?.seconds ?? 0, "end_seconds": lastEnd.seconds]
++        let full: [String: Any] = ["sha256": fullHash.finalize().map { String(format: "%02x", $0) }.joined(),
++            "samples": fullSamples, "bytes": fullBytes,
++            "first_seconds": firstTime?.seconds ?? 0, "end_seconds": lastEnd.seconds]
++        let valid: [String: Any] = ["plane_sha256": planeHashes.map { $0.finalize().map { String(format: "%02x", $0) }.joined() },
++            "plane_channels": planeChannels, "samples": validSamples, "bytes": validBytes,
++            "clock_runs": clockRuns, "format": format,
++            "range_start": range.start.seconds, "range_end": CMTimeRangeGetEnd(range).seconds]
++        let result: [String: Any] = ["in_timeline": valid, "full_stream": full,
++            "outside_timeline_samples": fullSamples - validSamples]
+         try JSONSerialization.data(withJSONObject: result, options: [.sortedKeys, .prettyPrinted]).write(to: url)
+     }
+ }
+--- a/ExportReview/prepare_baseline.py
++++ b/ExportReview/prepare_baseline.py
+@@ -26,7 +26,7 @@
+ # Audio probes observe bytes/timestamps without changing baseline scheduling.
+ s = p.read_text()
+ s = s.replace('        while let sampleBuffer = output.copyNextSampleBuffer() {\n            if cancelFlag.isCancelled',
+-              '        #if DEBUG\n        let audioProbe = try StudioExportAudioProbe.make()\n        #endif\n        while let sampleBuffer = output.copyNextSampleBuffer() {\n            if cancelFlag.isCancelled', 1)
++              '        #if DEBUG\n        let audioProbe = try StudioExportAudioProbe.make(validating: validationRange)\n        #endif\n        while let sampleBuffer = output.copyNextSampleBuffer() {\n            if cancelFlag.isCancelled', 1)
+ s = s.replace('            if !input.append(sampleBuffer) {',
+               '            #if DEBUG\n            try audioProbe?.record(sampleBuffer)\n            #endif\n            if !input.append(sampleBuffer) {', 1)
+ # The audio pump is the last occurrence before the output helpers.
+@@ -35,3 +35,11 @@
+                        '        #if DEBUG\n        try audioProbe?.finish()\n        #endif\n        input.markAsFinished()', 1)
+ s = s[:pos] + audio
+ p.write_text(s)
++
++# Pass the original reader range only to the observational PCM probe.
++s = p.read_text()
++s = s.replace('                input: writerAudioInput,\n                cancelFlag: cancelFlag',
++              '                input: writerAudioInput,\n                validationRange: exportTimeRange,\n                cancelFlag: cancelFlag', 1)
++s = s.replace('        input: AVAssetWriterInput?,\n        cancelFlag: CancelFlag\n    ) async throws {',
++              '        input: AVAssetWriterInput?,\n        validationRange: CMTimeRange,\n        cancelFlag: CancelFlag\n    ) async throws {', 1)
++p.write_text(s)
