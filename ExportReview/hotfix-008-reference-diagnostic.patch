@@ -1,0 +1,19 @@
+--- a/ExportReview/run_native_final.py
++++ b/ExportReview/run_native_final.py
+@@ -156,12 +156,15 @@
+         a.frombytes(plane.read_bytes()); b.frombytes(other.read_bytes())
+         if sys.byteorder != 'little':
+             a.byteswap(); b.byteswap()
+-        assert len(a) == len(b), 'Baseline in-cut sample count is not repeatable'
++        # This diagnoses the baseline; it is not a candidate acceptance gate.
++        # Record differing lengths instead of assuming baseline repeatability.
++        reference_count, alternate_count = len(a), len(b)
+         changed = [i for i, (x, y) in enumerate(zip(a, b)) if x != y]
+         squared_error = sum((x-y)**2 for x,y in zip(a,b))
+         energy = sum(x*x for x in a)
+         repeatability_differences.append(dict(reference=str(reference_folders[0].name),
+             alternate=str(folder.name), plane=plane.name, changed_scalar_samples=len(changed),
++            reference_scalar_samples=reference_count, alternate_scalar_samples=alternate_count,
+             first_changed_scalar=changed[0] if changed else None,
+             last_changed_scalar=changed[-1] if changed else None,
+             peak_absolute_difference=max((abs(x-y) for x,y in zip(a,b)), default=0),
