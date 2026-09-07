@@ -1,0 +1,54 @@
+name: Studio export review
+on:
+  push:
+    branches: [perf/metal-studio-export-pass2-review]
+permissions:
+  contents: read
+concurrency:
+  group: studio-export-review-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  source:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Archive the exact reviewed sources
+        run: git archive HEAD -o "$RUNNER_TEMP/screendrop-source.tar"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: reviewed-source
+          path: ${{ runner.temp }}/screendrop-source.tar
+          retention-days: 1
+  build:
+    runs-on: macos-26
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Record environment and select Xcode 26.4 when available
+        run: |
+          if [ -d /Applications/Xcode_26.4.app/Contents/Developer ]; then
+            echo 'DEVELOPER_DIR=/Applications/Xcode_26.4.app/Contents/Developer' >> "$GITHUB_ENV"
+          fi
+          sw_vers
+          uname -m
+          xcodebuild -version
+          system_profiler SPDisplaysDataType
+      - name: Build Debug without signing
+        run: |
+          set -o pipefail
+          xcodebuild build -project Screendrop.xcodeproj -scheme Screendrop -configuration Debug -destination 'generic/platform=macOS' -derivedDataPath "$RUNNER_TEMP/StudioDebug" CODE_SIGNING_ALLOWED=NO ARCHS=arm64 ONLY_ACTIVE_ARCH=YES 2>&1 | tee "$RUNNER_TEMP/studio-debug.log"
+      - name: Build Release without signing
+        run: |
+          set -o pipefail
+          xcodebuild build -project Screendrop.xcodeproj -scheme Screendrop -configuration Release -destination 'generic/platform=macOS' -derivedDataPath "$RUNNER_TEMP/StudioRelease" CODE_SIGNING_ALLOWED=NO ARCHS=arm64 ONLY_ACTIVE_ARCH=YES 2>&1 | tee "$RUNNER_TEMP/studio-release.log"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: build-logs
+          path: ${{ runner.temp }}/studio-*.log
+          retention-days: 1
