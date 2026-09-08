@@ -21,7 +21,7 @@ struct RecordingCameraBubbleSettings: Equatable {
     /// 0.5 = circle, smaller values square the bubble off.
     var roundness: CGFloat = 0.25
     /// Width ÷ height of the bubble. 1.0 = square (legacy behavior),
-    /// 16/9 ≈ 1.78 = widescreen rounded rect.
+    /// above 1 = landscape (16/9 ≈ 1.78), below 1 = portrait (9/16 = 0.5625).
     var aspect: CGFloat = 1.0
 }
 
@@ -30,12 +30,16 @@ enum RecordingCameraAspect: CGFloat, CaseIterable {
     case square = 1.0
     case fourThree = 1.3333333333333333
     case sixteenNine = 1.7777777777777777
+    case threeFour = 0.75
+    case nineSixteen = 0.5625
 
     var title: String {
         switch self {
         case .square: "Square"
         case .fourThree: "4:3"
         case .sixteenNine: "16:9"
+        case .threeFour: "3:4"
+        case .nineSixteen: "9:16"
         }
     }
 }
@@ -502,7 +506,8 @@ nonisolated struct RecordingStudioLayout: Sendable {
         var bubbleCornerRadius: CGFloat = 0
         if includeBubble, style.camera.isVisible {
             let height = max(24, style.camera.size * minDimension)
-            let width = max(24, height * max(1, style.camera.aspect))
+            let aspect = min(2, max(0.5, style.camera.aspect))
+            let width = max(24, height * aspect)
             var center = CGPoint(
                 x: style.camera.center.x * canvasSize.width,
                 y: style.camera.center.y * canvasSize.height
