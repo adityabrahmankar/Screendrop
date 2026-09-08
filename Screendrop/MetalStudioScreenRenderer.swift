@@ -291,6 +291,7 @@ nonisolated final class MetalStudioScreenRenderer: @unchecked Sendable {
         accumulationTextureDescriptor.sampleCount = 1
         accumulationTextureDescriptor.usage = [.renderTarget, .shaderRead]
         accumulationTextureDescriptor.storageMode = .private
+        accumulationTextureDescriptor.hazardTrackingMode = .tracked
         guard let accumulationTexture = device.makeTexture(descriptor: accumulationTextureDescriptor) else {
             throw RendererError.accumulationTextureCreationFailed
         }
@@ -319,11 +320,25 @@ nonisolated final class MetalStudioScreenRenderer: @unchecked Sendable {
     /// the Core Graphics reference backend. Samples accumulate in the
     /// configured floating-point texture and are converted to the writer's
     /// 8-bit BGRA buffer only once at the end.
+    /// Synchronous reference entry point used by the quality harness.
     func render(
         screenFrame: CVPixelBuffer,
         destination: CVPixelBuffer,
         sampleRects: [CGRect]
     ) throws {
+        try submit(screenFrame: screenFrame, destination: destination,
+                   sampleRects: sampleRects).waitUntilCompleted()
+    }
+
+    /// Submit in presentation order on the one export worker. The classic
+    /// tracked Metal queue serializes conflicting accesses to the shared
+    /// accumulation texture; each output frame has a distinct destination.
+    /// Do not substitute a Metal 4/untracked queue without explicit barriers.
+    func submit(
+        screenFrame: CVPixelBuffer,
+        destination: CVPixelBuffer,
+        sampleRects: [CGRect]
+    ) throws -> Submission {
         guard (1...24).contains(sampleRects.count) else {
             throw RendererError.invalidSampleCount
         }
@@ -332,16 +347,19 @@ nonisolated final class MetalStudioScreenRenderer: @unchecked Sendable {
             throw RendererError.invalidDestinationSize
         }
 
-        let sourceTexture = try texture(
+        let sourceBinding = try texture(
             from: screenFrame,
             pixelFormat: .bgra8Unorm,
             failure: RendererError.sourceTextureCreationFailed
         )
-        let destinationTexture = try texture(
+        let destinationBinding = try texture(
             from: destination,
             pixelFormat: .bgra8Unorm,
             failure: RendererError.destinationTextureCreationFailed
         )
+
+        let sourceTexture = sourceBinding.texture
+        let destinationTexture = destinationBinding.texture
 
         guard let commandBuffer = commandQueue.makeCommandBuffer() else {
             throw RendererError.commandBufferCreationFailed
@@ -423,10 +441,51 @@ nonisolated final class MetalStudioScreenRenderer: @unchecked Sendable {
         copyEncoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
         copyEncoder.endEncoding()
 
+        // Retaining only MTLTexture is not sufficient for a texture backed
+        // by a Core Video pool. Keep BOTH CVMetalTexture wrappers and BOTH
+        // pixel buffers alive, even if cancellation drops the Submission.
+        let lease = TextureLease(source: sourceBinding, destination: destinationBinding)
+        commandBuffer.addCompletedHandler { [lease] _ in
+            withExtendedLifetime(lease) {}
+        }
         commandBuffer.commit()
-        commandBuffer.waitUntilCompleted()
-        guard commandBuffer.status == .completed else {
-            throw RendererError.commandFailed(commandBuffer.error)
+        return Submission(commandBuffer: commandBuffer)
+    }
+
+    nonisolated final class Submission: @unchecked Sendable {
+        private let commandBuffer: any MTLCommandBuffer
+
+        fileprivate init(commandBuffer: any MTLCommandBuffer) {
+            self.commandBuffer = commandBuffer
+        }
+
+        /// Only the oldest slot waits, after later slots have been submitted.
+        /// The caller runs on its dedicated export queue, not the main actor.
+        func waitUntilCompleted() throws {
+            commandBuffer.waitUntilCompleted()
+            guard commandBuffer.status == .completed else {
+                throw RendererError.commandFailed(commandBuffer.error)
+            }
+        }
+
+        var gpuSeconds: Double {
+            guard commandBuffer.status == .completed else { return 0 }
+            return max(0, commandBuffer.gpuEndTime - commandBuffer.gpuStartTime)
+        }
+    }
+
+    private struct TextureBinding {
+        let pixelBuffer: CVPixelBuffer
+        let wrapper: CVMetalTexture
+        let texture: any MTLTexture
+    }
+
+    nonisolated private final class TextureLease: @unchecked Sendable {
+        let source: TextureBinding
+        let destination: TextureBinding
+        init(source: TextureBinding, destination: TextureBinding) {
+            self.source = source
+            self.destination = destination
         }
     }
 
@@ -481,7 +540,7 @@ nonisolated final class MetalStudioScreenRenderer: @unchecked Sendable {
         from pixelBuffer: CVPixelBuffer,
         pixelFormat: MTLPixelFormat,
         failure: (OSStatus) -> RendererError
-    ) throws -> any MTLTexture {
+    ) throws -> TextureBinding {
         let width = CVPixelBufferGetWidth(pixelBuffer)
         let height = CVPixelBufferGetHeight(pixelBuffer)
         var cvTexture: CVMetalTexture?
@@ -501,6 +560,6 @@ nonisolated final class MetalStudioScreenRenderer: @unchecked Sendable {
               let texture = CVMetalTextureGetTexture(cvTexture) else {
             throw failure(status)
         }
-        return texture
+        return TextureBinding(pixelBuffer: pixelBuffer, wrapper: cvTexture, texture: texture)
     }
 }

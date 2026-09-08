@@ -18,6 +18,8 @@ import AppKit
 import AVFoundation
 import CoreGraphics
 import CoreText
+import CoreVideo
+import Dispatch
 import Foundation
 import ImageIO
 import SwiftUI
@@ -51,6 +53,9 @@ nonisolated private final class StudioExportBenchmark: @unchecked Sendable {
     private var blurSamplesTotal = 0
     private var blurSamplesMax = 0
     private var blurredFrames = 0
+    private var stages: [String: Double] = [:]
+    private var reusedFrames = 0
+    private var peakSlots = 0
     #endif
 
     init(backend: String) {
@@ -130,6 +135,24 @@ nonisolated private final class StudioExportBenchmark: @unchecked Sendable {
         #endif
     }
 
+    func recordStage(_ name: String, seconds: Double) {
+        #if DEBUG
+        lock.withLock { stages[name, default: 0] += seconds }
+        #endif
+    }
+
+    func recordReuse() {
+        #if DEBUG
+        lock.withLock { reusedFrames += 1 }
+        #endif
+    }
+
+    func recordSlots(_ count: Int) {
+        #if DEBUG
+        lock.withLock { peakSlots = max(peakSlots, count) }
+        #endif
+    }
+
     func printSummary(wallClockSeconds: Double) {
         #if DEBUG
         let snapshot = lock.withLock {
@@ -153,6 +176,11 @@ nonisolated private final class StudioExportBenchmark: @unchecked Sendable {
             ? Double(snapshot.blurSamplesTotal) / Double(snapshot.frames)
             : 0
 
+        let extra = lock.withLock {
+            "pipeline_depth=\(StudioExportPipelineOptions.depth)\n"
+                + "peak_slots=\(peakSlots)\nreused_frames=\(reusedFrames)\n"
+                + stages.keys.sorted().map { "\($0)=\(stages[$0] ?? 0)" }.joined(separator: "\n")
+        }
         let summary = """
         [Screendrop Export Benchmark]
         timestamp=\(ISO8601DateFormatter().string(from: Date()))
@@ -170,6 +198,7 @@ nonisolated private final class StudioExportBenchmark: @unchecked Sendable {
         blur_samples_avg=\(averageBlurSamples)
         blur_samples_max=\(snapshot.blurSamplesMax)
         blurred_frames=\(snapshot.blurredFrames)
+        \(extra)
         """
         print(summary)
         // GUI launches can keep stdout buffered for the lifetime of the app;
@@ -278,6 +307,7 @@ nonisolated final class RecordingStudioExporter: @unchecked Sendable {
     enum ExportError: LocalizedError {
         case noVideoTrack
         case writerFailed(Error?)
+        case pixelBufferAllocationFailed(CVReturn)
         case cancelled
 
         var errorDescription: String? {
@@ -286,30 +316,28 @@ nonisolated final class RecordingStudioExporter: @unchecked Sendable {
                 "The recording has no video track."
             case .writerFailed(let error):
                 error?.localizedDescription ?? "Writing the exported video failed."
+            case .pixelBufferAllocationFailed(let status):
+                "Could not allocate an export frame (Core Video status \(status))."
             case .cancelled:
                 "Export cancelled."
             }
         }
     }
 
-    private final class CancelFlag: @unchecked Sendable {
-        private let lock = NSLock()
-        private var cancelled = false
-
-        func cancel() {
-            lock.withLock { cancelled = true }
-        }
-
-        var isCancelled: Bool {
-            lock.withLock { cancelled }
-        }
-    }
+    private typealias CancelFlag = StudioExportControl
 
     func export(
         _ configuration: Configuration,
         progress: @escaping @Sendable (Double) -> Void
     ) async throws -> URL {
         let cancelFlag = CancelFlag()
+        // A user-requested long export must not be suspended by App Nap or
+        // idle system sleep. Display sleep remains independent.
+        let activity = ProcessInfo.processInfo.beginActivity(
+            options: .userInitiated,
+            reason: "Exporting the recording requested by the user"
+        )
+        defer { ProcessInfo.processInfo.endActivity(activity) }
         return try await withTaskCancellationHandler {
             try await run(configuration, cancelFlag: cancelFlag, progress: progress)
         } onCancel: {
@@ -372,7 +400,11 @@ nonisolated final class RecordingStudioExporter: @unchecked Sendable {
         let screenReader = try AVAssetReader(asset: screenAsset)
         let videoOutput = AVAssetReaderTrackOutput(
             track: videoTrack,
-            outputSettings: [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA]
+            outputSettings: [
+                kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+                kCVPixelBufferMetalCompatibilityKey as String: true,
+                kCVPixelBufferIOSurfacePropertiesKey as String: [:] as [String: Any]
+            ]
         )
         videoOutput.alwaysCopiesSampleData = false
         screenReader.add(videoOutput)
@@ -417,11 +449,33 @@ nonisolated final class RecordingStudioExporter: @unchecked Sendable {
             url: configuration.cameraURL,
             offset: configuration.cameraOffset
         )
+        defer { cameraFeed?.cancel() }
 
         // Writer
         let container = configuration.exportSettings.effectiveContainer
         let outputURL = Self.temporaryOutputURL(container: container)
         let writer = try AVAssetWriter(outputURL: outputURL, fileType: container.fileType)
+        var exportSucceeded = false
+        let capturedReplacementReader = replacementReader
+        defer {
+            if screenReader.status == .reading { screenReader.cancelReading() }
+            if capturedReplacementReader?.status == .reading { capturedReplacementReader?.cancelReading() }
+            if !exportSucceeded {
+                if writer.status == .writing { writer.cancelWriting() }
+                try? FileManager.default.removeItem(at: outputURL)
+            }
+        }
+        // Wake readers immediately. Writer cancellation happens only after
+        // BOTH pumps have exited, so it cannot race a late append.
+        let readerCancellation = StudioExportReaderCancellation(
+            readers: [screenReader] + (capturedReplacementReader.map { [$0] } ?? [])
+        )
+        let ioCancellation = cancelFlag.onFailure {
+            readerCancellation.cancel()
+            cameraFeed?.cancel()
+        }
+        defer { cancelFlag.removeHandler(ioCancellation) }
+        try cancelFlag.check()
         // Faststart puts the index ahead of the media so a shared link plays
         // before it finishes downloading. The writer pays for that with an
         // extra pass at the end, so only MP4 - the container people actually
@@ -451,7 +505,9 @@ nonisolated final class RecordingStudioExporter: @unchecked Sendable {
             sourcePixelBufferAttributes: [
                 kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
                 kCVPixelBufferWidthKey as String: canvasWidth,
-                kCVPixelBufferHeightKey as String: canvasHeight
+                kCVPixelBufferHeightKey as String: canvasHeight,
+                kCVPixelBufferMetalCompatibilityKey as String: true,
+                kCVPixelBufferIOSurfacePropertiesKey as String: [:] as [String: Any]
             ]
         )
 
@@ -468,6 +524,7 @@ nonisolated final class RecordingStudioExporter: @unchecked Sendable {
             audioInput = input
         }
 
+        try cancelFlag.check()
         guard screenReader.startReading() else {
             throw screenReader.error ?? ExportError.writerFailed(nil)
         }
@@ -480,24 +537,30 @@ nonisolated final class RecordingStudioExporter: @unchecked Sendable {
         }
         writer.startSession(atSourceTime: exportStartTime)
 
-        let compositor = StudioFrameCompositor(
-            canvasSize: canvasSize,
-            videoCropRect: configuration.videoCropRect,
-            style: configuration.style,
-            viewportTimeline: configuration.viewportTimeline,
-            pointerTimeline: configuration.pointerTimeline,
-            showsPressEffects: configuration.showsPressEffects,
-            keystrokeTimeline: configuration.keystrokeTimeline,
-            keystrokePlacement: configuration.keystrokePlacement,
-            subtitleTimeline: configuration.subtitleTimeline,
-            subtitleStyle: configuration.subtitleStyle,
-            karaokeTimeline: configuration.karaokeTimeline,
-            includeBubble: cameraFeed != nil,
-            outputFrameInterval: 1 / Self.outputFrameRate,
-            benchmark: benchmark,
-            reframe: configuration.reframe,
-            fitContentAspect: configuration.fitContentAspect
-        )
+        let includeBubble = cameraFeed != nil
+        let compositor = await withCheckedContinuation { continuation in
+            DispatchQueue(label: "com.screendrop.studio.export.prepare", qos: .userInitiated).async {
+                let compositor = StudioFrameCompositor(
+                    canvasSize: canvasSize,
+                    videoCropRect: configuration.videoCropRect,
+                    style: configuration.style,
+                    viewportTimeline: configuration.viewportTimeline,
+                    pointerTimeline: configuration.pointerTimeline,
+                    showsPressEffects: configuration.showsPressEffects,
+                    keystrokeTimeline: configuration.keystrokeTimeline,
+                    keystrokePlacement: configuration.keystrokePlacement,
+                    subtitleTimeline: configuration.subtitleTimeline,
+                    subtitleStyle: configuration.subtitleStyle,
+                    karaokeTimeline: configuration.karaokeTimeline,
+                    includeBubble: includeBubble,
+                    outputFrameInterval: 1 / Self.outputFrameRate,
+                    benchmark: benchmark,
+                    reframe: configuration.reframe,
+                    fitContentAspect: configuration.fitContentAspect
+                )
+                continuation.resume(returning: compositor)
+            }
+        }
 
         let screenAudioOutput = audioOutput
         let writerAudioInput = audioInput
@@ -505,6 +568,8 @@ nonisolated final class RecordingStudioExporter: @unchecked Sendable {
         do {
             async let videoDone: Void = pumpVideo(
                 output: videoOutput,
+                reader: screenReader,
+                writer: writer,
                 input: videoInput,
                 adaptor: adaptor,
                 compositor: compositor,
@@ -516,30 +581,26 @@ nonisolated final class RecordingStudioExporter: @unchecked Sendable {
             )
             async let audioDone: Void = pumpAudio(
                 output: screenAudioOutput,
+                reader: capturedReplacementReader ?? screenReader,
+                writer: writer,
                 input: writerAudioInput,
                 cancelFlag: cancelFlag
             )
             _ = try await (videoDone, audioDone)
         } catch {
-            screenReader.cancelReading()
-            replacementReader?.cancelReading()
-            cameraFeed?.cancel()
-            writer.cancelWriting()
-            try? FileManager.default.removeItem(at: outputURL)
-            throw error
+            throw cancelFlag.failure ?? error
         }
 
-        cameraFeed?.cancel()
-
-        await withCheckedContinuation { continuation in
-            writer.finishWriting {
-                continuation.resume()
-            }
-        }
-        guard writer.status == .completed else {
-            try? FileManager.default.removeItem(at: outputURL)
-            throw ExportError.writerFailed(writer.error)
-        }
+        try cancelFlag.check()
+        #if DEBUG
+        let finishStartedAt = ProcessInfo.processInfo.systemUptime
+        #endif
+        try await StudioExportWriterFinisher(writer: writer, control: cancelFlag).finish()
+        #if DEBUG
+        benchmark.recordStage("finalize_seconds", seconds: ProcessInfo.processInfo.systemUptime - finishStartedAt)
+        #endif
+        try cancelFlag.check()
+        exportSucceeded = true
         benchmark.setOutputURL(outputURL)
         progress(1)
         return outputURL
@@ -547,6 +608,8 @@ nonisolated final class RecordingStudioExporter: @unchecked Sendable {
 
     private func pumpVideo(
         output: AVAssetReaderTrackOutput,
+        reader: AVAssetReader,
+        writer: AVAssetWriter,
         input: AVAssetWriterInput,
         adaptor: AVAssetWriterInputPixelBufferAdaptor,
         compositor: StudioFrameCompositor,
@@ -556,116 +619,264 @@ nonisolated final class RecordingStudioExporter: @unchecked Sendable {
         benchmark: StudioExportBenchmark,
         progress: @escaping @Sendable (Double) -> Void
     ) async throws {
-        // Render on a fixed output clock, not per source frame. Screen
-        // captures only contain frames where pixels changed, so a static
-        // screen has second-long gaps - but the virtual camera animates
-        // through them (most zoom-outs happen exactly there, seconds after
-        // the last click). Each tick re-renders the newest source frame at
-        // or before it; only writing on source arrivals would hold the last
-        // zoomed frame through the move and then visibly jump.
-        let frameRate = Self.outputFrameRate
-        let duration = clipTimeline.duration
-        let frameCount = max(1, Int((duration * frameRate).rounded()))
-
-        func nextSourceFrame() -> (buffer: CVPixelBuffer, time: TimeInterval)? {
-            while let sampleBuffer = output.copyNextSampleBuffer() {
-                guard let buffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { continue }
-                return (buffer, CMSampleBufferGetPresentationTimeStamp(sampleBuffer).seconds)
+        // AVAssetReader, Core Graphics and oldest-slot GPU waits are blocking.
+        // A dedicated worker avoids blocking a Swift concurrency worker thread.
+        let queue = DispatchQueue(label: "com.screendrop.studio.export.video", qos: .userInitiated,
+                                  autoreleaseFrequency: .workItem)
+        let io = StudioExportVideoIO(output: output, reader: reader, writer: writer,
+                                     input: input, adaptor: adaptor)
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, any Error>) in
+            queue.async {
+                do {
+                    try self.pumpVideoOnWorker(output: io.output, reader: io.reader, writer: io.writer,
+                        input: io.input, adaptor: io.adaptor, compositor: compositor, cameraFeed: cameraFeed,
+                        clipTimeline: clipTimeline, cancelFlag: cancelFlag,
+                        benchmark: benchmark, progress: progress)
+                    continuation.resume()
+                } catch {
+                    // Fail and wake the sibling BEFORE resuming this task.
+                    // Waiting until the async-let scope exits can deadlock it.
+                    cancelFlag.fail(error)
+                    continuation.resume(throwing: cancelFlag.failure ?? error)
+                }
             }
-            return nil
+        }
+    }
+
+    private func pumpVideoOnWorker(
+        output: AVAssetReaderTrackOutput,
+        reader: AVAssetReader,
+        writer: AVAssetWriter,
+        input: AVAssetWriterInput,
+        adaptor: AVAssetWriterInputPixelBufferAdaptor,
+        compositor: StudioFrameCompositor,
+        cameraFeed: CameraFrameFeed?,
+        clipTimeline: RecordingClipTimeline,
+        cancelFlag: CancelFlag,
+        benchmark: StudioExportBenchmark,
+        progress: @escaping @Sendable (Double) -> Void
+    ) throws {
+        let wake = StudioExportWakeSignal()
+        let observation = input.observe(\.isReadyForMoreMediaData, options: [.new]) { _, _ in wake.signal() }
+        let cancellation = cancelFlag.onFailure { wake.signal() }
+        defer {
+            observation.invalidate()
+            cancelFlag.removeHandler(cancellation)
+        }
+        let clipIndex = StudioExportClipIndex(clipTimeline)
+        let frameRate = Self.outputFrameRate
+        // Preserve the exact established frame count and 600-timescale PTS.
+        let frameCount = max(1, Int((clipIndex.duration * frameRate).rounded()))
+        #if DEBUG
+        let frameProbe = try StudioExportFrameProbe.make()
+        #endif
+        let depth = StudioExportPipelineOptions.depth
+        let permitsReuse = compositor.permitsFrameReuse
+        guard let pool = adaptor.pixelBufferPool else { throw ExportError.writerFailed(writer.error) }
+
+        func nextSourceFrame() throws -> (buffer: CVPixelBuffer, time: TimeInterval)? {
+            #if DEBUG
+            let started = ProcessInfo.processInfo.systemUptime
+            defer { benchmark.recordStage("decode_screen_seconds", seconds: ProcessInfo.processInfo.systemUptime - started) }
+            #endif
+            return try autoreleasepool {
+                try cancelFlag.check()
+                while let sample = output.copyNextSampleBuffer() {
+                    guard let image = CMSampleBufferGetImageBuffer(sample) else { continue }
+                    return (image, CMSampleBufferGetPresentationTimeStamp(sample).seconds)
+                }
+                try Self.checkReader(reader, control: cancelFlag)
+                return nil
+            }
         }
 
         var currentBuffer: CVPixelBuffer?
-        var pending = nextSourceFrame()
+        var pendingSource = try nextSourceFrame()
+        guard pendingSource != nil else { throw ExportError.noVideoTrack }
         var previousClipID: UUID?
+        var nextFrameIndex = 0
+        var slots: [StudioExportFrameSlot] = []
+        slots.reserveCapacity(depth)
+        var previousVisual: StudioExportVisualFrame?
 
-        for frame in 0..<frameCount {
-            if cancelFlag.isCancelled { throw ExportError.cancelled }
-            let editorTime = Double(frame) / frameRate
-            guard let location = clipTimeline.location(at: editorTime) else { break }
+        func prepareNextFrame() throws -> StudioExportFrameSlot {
+            try cancelFlag.check()
+            let index = nextFrameIndex
+            let editorTime = Double(index) / frameRate
+            guard let location = clipIndex.location(at: editorTime) else {
+                throw ExportError.writerFailed(nil)
+            }
             let sourceTime = location.sourceTime
-
             if previousClipID != location.segmentID {
-                // Never carry a sparse screen-capture frame across a hard
-                // edit boundary - the reader may not have caught up yet to
-                // the new clip's starting source position.
-                if previousClipID != nil {
-                    currentBuffer = nil
-                }
+                if previousClipID != nil { currentBuffer = nil }
                 previousClipID = location.segmentID
             }
-
-            while let sample = pending, sample.time <= editorTime {
+            // Hold sparse frames, including the established early-first-frame
+            // behavior. Never carry a held screen frame across a hard cut.
+            while let sample = pendingSource, sample.time <= editorTime {
                 currentBuffer = sample.buffer
-                pending = nextSourceFrame()
+                pendingSource = try nextSourceFrame()
             }
-            // Ticks before the first source frame show it early rather than
-            // emitting black; a capture with no frames at all has nothing to
-            // render.
-            guard let sourceBuffer = currentBuffer ?? pending?.buffer else { break }
-
-            #if DEBUG
-            let writerWaitStartedAt = ProcessInfo.processInfo.systemUptime
-            #endif
-            while !input.isReadyForMoreMediaData {
-                if cancelFlag.isCancelled { throw ExportError.cancelled }
-                try await Task.sleep(nanoseconds: 2_000_000)
+            guard let source = currentBuffer ?? pendingSource?.buffer else {
+                throw ExportError.noVideoTrack
             }
             #if DEBUG
-            benchmark.recordWriterWait(
-                seconds: ProcessInfo.processInfo.systemUptime - writerWaitStartedAt
-            )
+            let cameraStarted = ProcessInfo.processInfo.systemUptime
             #endif
-
-            guard let pool = adaptor.pixelBufferPool else {
-                throw ExportError.writerFailed(nil)
+            let camera = try cameraFeed?.latestFrame(at: sourceTime)
+            #if DEBUG
+            benchmark.recordStage("decode_camera_seconds", seconds: ProcessInfo.processInfo.systemUptime - cameraStarted)
+            let prepareStarted = ProcessInfo.processInfo.systemUptime
+            defer {
+                let seconds = ProcessInfo.processInfo.systemUptime - prepareStarted
+                benchmark.recordStage("prepare_cpu_seconds", seconds: seconds)
+                benchmark.recordRender(seconds: seconds)
             }
-            var destinationBuffer: CVPixelBuffer?
-            CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pool, &destinationBuffer)
-            guard let destinationBuffer else {
-                throw ExportError.writerFailed(nil)
+            #endif
+            let state = compositor.visualState(screenFrame: source, cameraFrame: camera,
+                                               editorTime: editorTime, sourceTime: sourceTime)
+            let visual: StudioExportVisualFrame
+            if permitsReuse, let previousVisual, previousVisual.state == state {
+                // The same immutable output buffer can be appended at a new
+                // PTS. This skips rendering, NEVER an output frame or effect.
+                visual = previousVisual
+                benchmark.recordReuse()
+            } else {
+                var destination: CVPixelBuffer?
+                let status = CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pool, &destination)
+                guard status == kCVReturnSuccess, let destination else {
+                    throw ExportError.pixelBufferAllocationFailed(status)
+                }
+                let submission = try compositor.prepareScreen(frameIndex: index, state: state,
+                    editorTime: editorTime, sourceTime: sourceTime, into: destination)
+                visual = StudioExportVisualFrame(state: state, buffer: destination, submission: submission,
+                                                editorTime: editorTime, sourceTime: sourceTime)
+                previousVisual = visual
             }
+            nextFrameIndex += 1
+            return StudioExportFrameSlot(index: index, editorTime: editorTime,
+                                         sourceTime: sourceTime, visual: visual)
+        }
 
-            let cameraBuffer = cameraFeed?.latestFrame(at: sourceTime)
-            try compositor.render(
-                frameIndex: frame,
-                screenFrame: sourceBuffer,
-                cameraFrame: cameraBuffer,
-                editorTime: editorTime,
-                sourceTime: sourceTime,
-                into: destinationBuffer
-            )
-
-            let pts = CMTime(seconds: editorTime, preferredTimescale: 600)
-            if !adaptor.append(destinationBuffer, withPresentationTime: pts) {
-                throw ExportError.writerFailed(nil)
+        while nextFrameIndex < frameCount || !slots.isEmpty {
+            try cancelFlag.check()
+            while slots.count < depth && nextFrameIndex < frameCount {
+                let slot = try autoreleasepool { try prepareNextFrame() }
+                slots.append(slot)
+                benchmark.recordSlots(slots.count)
             }
-
-            if frame % 10 == 0 {
-                progress(min(0.98, Double(frame) / Double(frameCount)))
+            let slot = slots.removeFirst() // bounded to at most three entries
+            try autoreleasepool {
+                let visual = slot.visual
+                if !visual.overlaysFinished {
+                    #if DEBUG
+                    let gpuWaitStarted = ProcessInfo.processInfo.systemUptime
+                    #endif
+                    try visual.submission?.waitUntilCompleted()
+                    #if DEBUG
+                    let wait = ProcessInfo.processInfo.systemUptime - gpuWaitStarted
+                    benchmark.recordStage("gpu_wait_seconds", seconds: wait)
+                    benchmark.recordStage("gpu_execution_seconds", seconds: visual.submission?.gpuSeconds ?? 0)
+                    benchmark.recordRender(seconds: wait)
+                    let overlaysStarted = ProcessInfo.processInfo.systemUptime
+                    #endif
+                    try cancelFlag.check()
+                    try compositor.finishOverlays(cameraFrame: visual.state.cameraFrame,
+                        editorTime: visual.editorTime, sourceTime: visual.sourceTime, into: visual.buffer)
+                    visual.overlaysFinished = true
+                    #if DEBUG
+                    let overlays = ProcessInfo.processInfo.systemUptime - overlaysStarted
+                    benchmark.recordStage("overlay_cpu_seconds", seconds: overlays)
+                    benchmark.recordRender(seconds: overlays)
+                    #endif
+                }
+                #if DEBUG
+                let writerWaitStarted = ProcessInfo.processInfo.systemUptime
+                #endif
+                try Self.waitForWriter(input, writer: writer, control: cancelFlag, wake: wake)
+                #if DEBUG
+                benchmark.recordWriterWait(seconds: ProcessInfo.processInfo.systemUptime - writerWaitStarted)
+                let appendStarted = ProcessInfo.processInfo.systemUptime
+                #endif
+                let pts = CMTime(seconds: slot.editorTime, preferredTimescale: 600)
+                #if DEBUG
+                try frameProbe?.record(visual.buffer, index: slot.index, time: pts)
+                #endif
+                guard adaptor.append(visual.buffer, withPresentationTime: pts) else {
+                    throw ExportError.writerFailed(writer.error)
+                }
+                #if DEBUG
+                benchmark.recordStage("append_seconds", seconds: ProcessInfo.processInfo.systemUptime - appendStarted)
+                #endif
+                if slot.index % 10 == 0 { progress(min(0.98, Double(slot.index) / Double(frameCount))) }
             }
         }
+        try Self.checkReader(reader, control: cancelFlag)
         input.markAsFinished()
     }
 
     private func pumpAudio(
         output: AVAssetReaderAudioMixOutput?,
+        reader: AVAssetReader,
+        writer: AVAssetWriter,
         input: AVAssetWriterInput?,
         cancelFlag: CancelFlag
     ) async throws {
         guard let output, let input else { return }
-
-        while let sampleBuffer = output.copyNextSampleBuffer() {
-            if cancelFlag.isCancelled { throw ExportError.cancelled }
-            while !input.isReadyForMoreMediaData {
-                if cancelFlag.isCancelled { throw ExportError.cancelled }
-                try await Task.sleep(nanoseconds: 2_000_000)
-            }
-            if !input.append(sampleBuffer) {
-                throw ExportError.writerFailed(nil)
+        let queue = DispatchQueue(label: "com.screendrop.studio.export.audio", qos: .userInitiated,
+                                  autoreleaseFrequency: .workItem)
+        let io = StudioExportAudioIO(output: output, reader: reader, writer: writer, input: input)
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, any Error>) in
+            queue.async {
+                let wake = StudioExportWakeSignal()
+                let observation = io.input.observe(\.isReadyForMoreMediaData, options: [.new]) { _, _ in wake.signal() }
+                let cancellation = cancelFlag.onFailure { wake.signal() }
+                defer {
+                    observation.invalidate()
+                    cancelFlag.removeHandler(cancellation)
+                }
+                do {
+                    while try autoreleasepool(invoking: { () throws -> Bool in
+                        try cancelFlag.check()
+                        // Discover EOF before waiting for readiness. Otherwise
+                        // an exhausted audio track can stall video interleaving.
+                        guard let sample = io.output.copyNextSampleBuffer() else {
+                            try Self.checkReader(io.reader, control: cancelFlag)
+                            return false
+                        }
+                        try Self.waitForWriter(io.input, writer: io.writer, control: cancelFlag, wake: wake)
+                        try cancelFlag.check()
+                        guard io.input.append(sample) else { throw ExportError.writerFailed(io.writer.error) }
+                        return true
+                    }) {}
+                    io.input.markAsFinished()
+                    continuation.resume()
+                } catch {
+                    cancelFlag.fail(error)
+                    continuation.resume(throwing: cancelFlag.failure ?? error)
+                }
             }
         }
-        input.markAsFinished()
+    }
+
+    private static func waitForWriter(
+        _ input: AVAssetWriterInput,
+        writer: AVAssetWriter,
+        control: StudioExportControl,
+        wake: StudioExportWakeSignal
+    ) throws {
+        try wake.waitUntil {
+            try control.check()
+            guard writer.status == .writing else { throw ExportError.writerFailed(writer.error) }
+            return input.isReadyForMoreMediaData
+        }
+    }
+
+    private static func checkReader(_ reader: AVAssetReader, control: StudioExportControl) throws {
+        try control.check()
+        if reader.status == .failed || reader.status == .cancelled {
+            throw reader.error ?? ExportError.writerFailed(nil)
+        }
     }
 
     private static func temporaryOutputURL(container: VideoExportContainer) -> URL {
@@ -712,6 +923,119 @@ nonisolated final class RecordingStudioExporter: @unchecked Sendable {
     }
 }
 
+// MARK: - Legacy AVFoundation worker ownership
+
+/// AVFoundation's legacy writer/reader types lack Sendable conformances.
+/// These narrowly scoped handles document the manual ownership contract:
+/// each output and writer input has exactly one dedicated worker. Shared
+/// reader cancellation/status and writer status are the only cross-worker
+/// operations. Finalization starts only after both workers have returned.
+/// The boxes do NOT make arbitrary concurrent append/read operations safe.
+nonisolated private struct StudioExportVideoIO: @unchecked Sendable {
+    let output: AVAssetReaderTrackOutput
+    let reader: AVAssetReader
+    let writer: AVAssetWriter
+    let input: AVAssetWriterInput
+    let adaptor: AVAssetWriterInputPixelBufferAdaptor
+}
+
+nonisolated private struct StudioExportAudioIO: @unchecked Sendable {
+    let output: AVAssetReaderAudioMixOutput
+    let reader: AVAssetReader
+    let writer: AVAssetWriter
+    let input: AVAssetWriterInput
+}
+
+/// Cancellation deliberately crosses the reader workers; it never consumes
+/// a sample or mutates their cursor state. Keep this exception explicit.
+nonisolated private struct StudioExportReaderCancellation: @unchecked Sendable {
+    let readers: [AVAssetReader]
+    func cancel() {
+        for reader in readers where reader.status == .reading { reader.cancelReading() }
+    }
+}
+
+// MARK: - Bounded frame ownership
+
+nonisolated private final class StudioExportVisualFrame {
+    let state: StudioFrameCompositor.VisualState
+    let buffer: CVPixelBuffer
+    let submission: MetalStudioScreenRenderer.Submission?
+    let editorTime: TimeInterval
+    let sourceTime: TimeInterval
+    var overlaysFinished = false
+
+    init(state: StudioFrameCompositor.VisualState, buffer: CVPixelBuffer,
+         submission: MetalStudioScreenRenderer.Submission?, editorTime: TimeInterval, sourceTime: TimeInterval) {
+        self.state = state
+        self.buffer = buffer
+        self.submission = submission
+        self.editorTime = editorTime
+        self.sourceTime = sourceTime
+    }
+}
+
+nonisolated private struct StudioExportFrameSlot {
+    let index: Int
+    let editorTime: TimeInterval
+    let sourceTime: TimeInterval
+    let visual: StudioExportVisualFrame
+}
+
+/// Serializes finishWriting and cancelWriting AFTER both media pumps exit.
+/// The continuation is owned by this queue and is resumed exactly once.
+nonisolated private final class StudioExportWriterFinisher: @unchecked Sendable {
+    private let writer: AVAssetWriter
+    private let control: StudioExportControl
+    private let queue = DispatchQueue(label: "com.screendrop.studio.export.finish")
+    private var continuation: CheckedContinuation<Void, any Error>?
+    private var cancellation: UUID?
+
+    init(writer: AVAssetWriter, control: StudioExportControl) {
+        self.writer = writer
+        self.control = control
+    }
+
+    func finish() async throws {
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, any Error>) in
+            queue.async {
+                self.continuation = continuation
+                self.cancellation = self.control.onFailure { [weak self] in
+                    guard let self else { return }
+                    self.queue.async { self.cancel() }
+                }
+                if self.control.failure != nil { self.cancel(); return }
+                guard self.writer.status == .writing else {
+                    self.resolve(.failure(RecordingStudioExporter.ExportError.writerFailed(self.writer.error)))
+                    return
+                }
+                self.writer.finishWriting { [weak self] in
+                    guard let self else { return }
+                    self.queue.async {
+                        if let error = self.control.failure { self.resolve(.failure(error)) }
+                        else if self.writer.status == .completed { self.resolve(.success(())) }
+                        else { self.resolve(.failure(RecordingStudioExporter.ExportError.writerFailed(self.writer.error))) }
+                    }
+                }
+            }
+        }
+    }
+
+    private func cancel() {
+        guard continuation != nil else { return }
+        if writer.status == .writing { writer.cancelWriting() }
+        resolve(.failure(control.failure ?? CancellationError()))
+    }
+
+    private func resolve(_ result: Result<Void, any Error>) {
+        guard let continuation else { return }
+        self.continuation = nil
+        if let cancellation { control.removeHandler(cancellation) }
+        cancellation = nil
+        continuation.resume(with: result)
+    }
+}
+
 // MARK: - Camera frame feed
 
 /// Sequential decoder for the camera movie that answers "latest camera frame
@@ -735,7 +1059,11 @@ nonisolated private final class CameraFrameFeed: @unchecked Sendable {
         let reader = try AVAssetReader(asset: asset)
         let output = AVAssetReaderTrackOutput(
             track: track,
-            outputSettings: [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA]
+            outputSettings: [
+                kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+                kCVPixelBufferMetalCompatibilityKey as String: true,
+                kCVPixelBufferIOSurfacePropertiesKey as String: [:] as [String: Any]
+            ]
         )
         output.alwaysCopiesSampleData = false
         reader.add(output)
@@ -748,7 +1076,7 @@ nonisolated private final class CameraFrameFeed: @unchecked Sendable {
         self.offset = offset
     }
 
-    func latestFrame(at screenTime: TimeInterval) -> CVPixelBuffer? {
+    func latestFrame(at screenTime: TimeInterval) throws -> CVPixelBuffer? {
         while !isFinished {
             if let pending = pendingFrame {
                 // Promote the very first frame unconditionally: the camera
@@ -765,6 +1093,9 @@ nonisolated private final class CameraFrameFeed: @unchecked Sendable {
             guard let buffer = CMSampleBufferGetImageBuffer(sample) else { continue }
             let time = CMSampleBufferGetPresentationTimeStamp(sample).seconds + offset
             pendingFrame = (buffer: buffer, time: time)
+        }
+        if reader.status == .failed || reader.status == .cancelled {
+            throw reader.error ?? RecordingStudioExporter.ExportError.cancelled
         }
         return currentFrame
     }
@@ -815,6 +1146,32 @@ nonisolated private final class StudioFrameCompositor: @unchecked Sendable {
     private let karaokeTimeline: KaraokeTimeline?
     private let reframe: ReframeTrack?
     private var artworkImageCache: [String: CGImage] = [:]
+
+    private struct KeystrokeTextKey: Equatable {
+        let modifiers: String
+        let key: String
+    }
+    private struct KeystrokeTextLayout {
+        let key: KeystrokeTextKey
+        let line: CTLine
+        let ascent: CGFloat
+        let descent: CGFloat
+        let width: CGFloat
+    }
+    private struct SubtitleTextKey: Equatable {
+        let text: String
+        let karaoke: KaraokeTimeline.Line?
+    }
+    private struct SubtitleTextLayout {
+        let key: SubtitleTextKey
+        let lines: [CTLine]
+        let widths: [CGFloat]
+        let ascent: CGFloat
+        let descent: CGFloat
+    }
+    private let cachesText = StudioExportPipelineOptions.cachesText
+    private var keystrokeTextCache: KeystrokeTextLayout?
+    private var subtitleTextCache: SubtitleTextLayout?
     private let pointerScale: CGFloat
     private let colorSpace: CGColorSpace
     private let backdrop: CGImage?
@@ -923,8 +1280,8 @@ nonisolated private final class StudioFrameCompositor: @unchecked Sendable {
             ? .coreGraphics
             : requestedBackend
         benchmark.setBackend(self.screenBackend.rawValue)
-        benchmark.setFilter(metalRenderer?.filter.rawValue ?? "none")
-        benchmark.setAccumulation(metalRenderer?.accumulation.rawValue ?? "none")
+        benchmark.setFilter(self.screenBackend == .metal ? metalRenderer?.filter.rawValue ?? "none" : "none")
+        benchmark.setAccumulation(self.screenBackend == .metal ? metalRenderer?.accumulation.rawValue ?? "none" : "none")
     }
 
     /// The virtual camera for a frame: the reframe crop-and-follow track
@@ -934,94 +1291,119 @@ nonisolated private final class StudioFrameCompositor: @unchecked Sendable {
         return RecordingVideoCropGeometry.viewport(base, crop: videoCropRect)
     }
 
-    func render(
-        frameIndex: Int,
+    /// Complete, conservative visual identity for reusing a finished frame.
+    /// Source/camera buffers are retained, not just their object identifiers,
+    /// so decoder-pool address reuse cannot produce a false cache hit.
+    struct VisualState: Equatable {
+        let screenFrame: CVPixelBuffer
+        let cameraFrame: CVPixelBuffer?
+        let viewport: ViewportFrame
+        let sampleRects: [CGRect]
+        let pointer: PointerFrame?
+        let keystroke: KeystrokeCaptionFrame?
+        let subtitle: String?
+        let karaoke: KaraokeTimeline.Line?
+
+        static func == (lhs: Self, rhs: Self) -> Bool {
+            lhs.screenFrame === rhs.screenFrame
+                && lhs.cameraFrame === rhs.cameraFrame
+                && lhs.viewport == rhs.viewport
+                && lhs.sampleRects == rhs.sampleRects
+                && lhs.pointer == rhs.pointer
+                && lhs.keystroke == rhs.keystroke
+                && lhs.subtitle == rhs.subtitle
+                && lhs.karaoke == rhs.karaoke
+        }
+    }
+
+    var permitsFrameReuse: Bool {
+        #if DEBUG
+        // The reference harness must capture every frame it requested.
+        if qualityHarness != nil { return false }
+        #endif
+        return StudioExportPipelineOptions.reusesIdenticalFrames
+    }
+
+    func visualState(
         screenFrame: CVPixelBuffer,
         cameraFrame: CVPixelBuffer?,
         editorTime: TimeInterval,
-        sourceTime: TimeInterval,
-        into destination: CVPixelBuffer
-    ) throws {
-        #if DEBUG
-        let renderStartedAt = ProcessInfo.processInfo.systemUptime
-        defer {
-            benchmark.recordRender(
-                seconds: ProcessInfo.processInfo.systemUptime - renderStartedAt
-            )
-        }
-        #endif
-
-        // Motion blur by temporal supersampling: while the virtual camera is
-        // moving, average several sub-frame camera states across exactly one
-        // output frame. The Core Graphics and Metal paths receive the same
-        // rects and the same 1/(i + 1) running-average alpha sequence.
+        sourceTime: TimeInterval
+    ) -> VisualState {
         let shutter = outputFrameInterval
         let sampleCount = blurSampleCount(at: editorTime, shutter: shutter)
-        #if DEBUG
         benchmark.recordFrame(blurSampleCount: sampleCount)
-        #endif
         let sampleRects = (0..<sampleCount).map { sample in
             let sampleTime = editorTime - shutter / 2
                 + shutter * (Double(sample) + 0.5) / Double(sampleCount)
             return layout.frameRect(for: viewportFrame(at: sampleTime))
         }
+        let subtitle = subtitleTimeline?.text(at: sourceTime)
+        return VisualState(
+            screenFrame: screenFrame,
+            cameraFrame: cameraFrame,
+            viewport: viewportFrame(at: editorTime),
+            sampleRects: sampleRects,
+            pointer: pointerTimeline?.frame(at: editorTime),
+            keystroke: keystrokeTimeline?.frame(at: sourceTime),
+            subtitle: subtitle,
+            karaoke: subtitle != nil && subtitleStyle.highlightsSpokenWord
+                ? karaokeTimeline?.line(at: sourceTime) : nil
+        )
+    }
 
+    /// Does not touch the destination with the CPU after GPU submission.
+    func prepareScreen(
+        frameIndex: Int,
+        state: VisualState,
+        editorTime: TimeInterval,
+        sourceTime: TimeInterval,
+        into destination: CVPixelBuffer
+    ) throws -> MetalStudioScreenRenderer.Submission? {
         #if DEBUG
         if let qualityHarness,
-           qualityHarness.shouldCapture(frameIndex: frameIndex, sampleCount: sampleCount) {
+           qualityHarness.shouldCapture(frameIndex: frameIndex, sampleCount: state.sampleRects.count) {
             try qualityHarness.capture(
                 frameIndex: frameIndex,
                 editorTime: editorTime,
                 sourceTime: sourceTime,
-                sampleCount: sampleCount,
-                screenFrame: screenFrame,
+                sampleCount: state.sampleRects.count,
+                screenFrame: state.screenFrame,
                 destination: destination,
-                sampleRects: sampleRects,
+                sampleRects: state.sampleRects,
                 coreGraphicsRenderer: coreGraphicsRenderer,
                 metalRenderer: metalRenderer
             )
         }
         #endif
-
-        if let metalRenderer {
-            // Metal owns the static backdrop and screen layer. Wait for the
-            // command buffer before reopening the destination for the overlay
-            // pass, which keeps the existing Core Graphics layers unchanged.
-            try metalRenderer.render(
-                screenFrame: screenFrame,
+        if screenBackend == .metal, let metalRenderer {
+            return try metalRenderer.submit(
+                screenFrame: state.screenFrame,
                 destination: destination,
-                sampleRects: sampleRects
+                sampleRects: state.sampleRects
             )
-            guard withDestinationContext(destination, body: { context in
-                drawOverlays(
-                    cameraFrame: cameraFrame,
-                    editorTime: editorTime,
-                    sourceTime: sourceTime,
-                    in: context
-                )
-            }) else {
-                throw RecordingStudioExporter.ExportError.writerFailed(nil)
-            }
-            return
         }
-
-        // Reference backend: this is the original Core Graphics raster path,
-        // retained both as a fallback when Metal is unavailable and as the
-        // visual comparison backend for export validation.
         guard coreGraphicsRenderer.render(
-            screenFrame: screenFrame,
+            screenFrame: state.screenFrame,
             destination: destination,
-            sampleRects: sampleRects
+            sampleRects: state.sampleRects
         ) else {
             throw RecordingStudioExporter.ExportError.writerFailed(nil)
         }
+        return nil
+    }
+
+    /// The overlay implementation and its layer order remain unchanged.
+    /// Call only after the frame's GPU submission has completed.
+    func finishOverlays(
+        cameraFrame: CVPixelBuffer?,
+        editorTime: TimeInterval,
+        sourceTime: TimeInterval,
+        into destination: CVPixelBuffer
+    ) throws {
         guard withDestinationContext(destination, body: { context in
-            drawOverlays(
-                cameraFrame: cameraFrame,
-                editorTime: editorTime,
-                sourceTime: sourceTime,
-                in: context
-            )
+            drawOverlays(cameraFrame: cameraFrame, editorTime: editorTime,
+                         sourceTime: sourceTime, in: context)
         }) else {
             throw RecordingStudioExporter.ExportError.writerFailed(nil)
         }
@@ -1031,7 +1413,7 @@ nonisolated private final class StudioFrameCompositor: @unchecked Sendable {
         _ destination: CVPixelBuffer,
         body: (CGContext) -> Void
     ) -> Bool {
-        CVPixelBufferLockBaseAddress(destination, [])
+        guard CVPixelBufferLockBaseAddress(destination, []) == kCVReturnSuccess else { return false }
         defer { CVPixelBufferUnlockBaseAddress(destination, []) }
 
         guard let base = CVPixelBufferGetBaseAddress(destination),
@@ -1225,28 +1607,40 @@ nonisolated private final class StudioFrameCompositor: @unchecked Sendable {
         }
 
         let metrics = KeystrokeCaptionMetrics(cardHeight: layout.cardRect.height)
-        let font = Self.captionFont(size: metrics.fontSize)
         let (modifierText, keyText) = KeystrokeCaptionMetrics.text(for: caption)
+        let key = KeystrokeTextKey(modifiers: modifierText, key: keyText)
+        let textLayout: KeystrokeTextLayout
+        if cachesText, let cached = keystrokeTextCache, cached.key == key {
+            textLayout = cached
+        } else {
+            let font = Self.captionFont(size: metrics.fontSize)
 
-        let text = NSMutableAttributedString()
-        if !modifierText.isEmpty {
-            text.append(NSAttributedString(string: modifierText, attributes: [
+            let text = NSMutableAttributedString()
+            if !modifierText.isEmpty {
+                text.append(NSAttributedString(string: modifierText, attributes: [
+                    NSAttributedString.Key(kCTFontAttributeName as String): font,
+                    NSAttributedString.Key(kCTForegroundColorAttributeName as String):
+                        CGColor(gray: 1, alpha: KeystrokeCaptionMetrics.modifierAlpha)
+                ]))
+            }
+            text.append(NSAttributedString(string: keyText, attributes: [
                 NSAttributedString.Key(kCTFontAttributeName as String): font,
                 NSAttributedString.Key(kCTForegroundColorAttributeName as String):
-                    CGColor(gray: 1, alpha: KeystrokeCaptionMetrics.modifierAlpha)
+                    CGColor(gray: 1, alpha: 1)
             ]))
-        }
-        text.append(NSAttributedString(string: keyText, attributes: [
-            NSAttributedString.Key(kCTFontAttributeName as String): font,
-            NSAttributedString.Key(kCTForegroundColorAttributeName as String):
-                CGColor(gray: 1, alpha: 1)
-        ]))
 
-        let line = CTLineCreateWithAttributedString(text)
-        var ascent: CGFloat = 0
-        var descent: CGFloat = 0
-        var leading: CGFloat = 0
-        let textWidth = CGFloat(CTLineGetTypographicBounds(line, &ascent, &descent, &leading))
+            let line = CTLineCreateWithAttributedString(text)
+            var ascent: CGFloat = 0
+            var descent: CGFloat = 0
+            var leading: CGFloat = 0
+            let textWidth = CGFloat(CTLineGetTypographicBounds(line, &ascent, &descent, &leading))
+            textLayout = KeystrokeTextLayout(key: key, line: line, ascent: ascent, descent: descent, width: textWidth)
+            if cachesText { keystrokeTextCache = textLayout }
+        }
+        let line = textLayout.line
+        let ascent = textLayout.ascent
+        let descent = textLayout.descent
+        let textWidth = textLayout.width
         guard textWidth > 0 else { return }
 
         let pillSize = CGSize(
@@ -1294,28 +1688,43 @@ nonisolated private final class StudioFrameCompositor: @unchecked Sendable {
         let metrics = SubtitleBarMetrics(canvasSize: canvasSize, style: subtitleStyle)
         let maximumTextWidth = metrics.maximumTextWidth(canvasWidth: canvasSize.width)
 
-        // On narrow canvases the text wraps into centered lines rather
-        // than shrinking into a full-width sliver; the font only scales
-        // down when even the maximum line count can't hold it.
-        var fontSize = metrics.fontSize
-        var wrappedLines: [CTLine] = []
-        for _ in 0..<3 {
-            let font = Self.captionFont(size: fontSize)
-            let attributed = subtitleAttributedText(plainText: text, at: time, font: font)
-            wrappedLines = Self.wrapLines(attributed, width: maximumTextWidth)
-            if wrappedLines.count <= SubtitleBarMetrics.maximumLineCount || fontSize <= 11 {
-                break
+        let key = SubtitleTextKey(
+            text: text,
+            karaoke: subtitleStyle.highlightsSpokenWord ? karaokeTimeline?.line(at: time) : nil
+        )
+        let textLayout: SubtitleTextLayout
+        if cachesText, let cached = subtitleTextCache, cached.key == key {
+            textLayout = cached
+        } else {
+            // On narrow canvases the text wraps into centered lines rather
+            // than shrinking into a full-width sliver; the font only scales
+            // down when even the maximum line count can't hold it.
+            var fontSize = metrics.fontSize
+            var wrappedLines: [CTLine] = []
+            for _ in 0..<3 {
+                let font = Self.captionFont(size: fontSize)
+                let attributed = subtitleAttributedText(plainText: text, at: time, font: font)
+                wrappedLines = Self.wrapLines(attributed, width: maximumTextWidth)
+                if wrappedLines.count <= SubtitleBarMetrics.maximumLineCount || fontSize <= 11 {
+                    break
+                }
+                fontSize *= CGFloat(SubtitleBarMetrics.maximumLineCount) / CGFloat(wrappedLines.count)
             }
-            fontSize *= CGFloat(SubtitleBarMetrics.maximumLineCount) / CGFloat(wrappedLines.count)
-        }
-        guard !wrappedLines.isEmpty else { return }
+            guard !wrappedLines.isEmpty else { return }
 
-        var ascent: CGFloat = 0
-        var descent: CGFloat = 0
-        var leading: CGFloat = 0
-        let lineWidths = wrappedLines.map {
-            CGFloat(CTLineGetTypographicBounds($0, &ascent, &descent, &leading))
+            var ascent: CGFloat = 0
+            var descent: CGFloat = 0
+            var leading: CGFloat = 0
+            let lineWidths = wrappedLines.map {
+                CGFloat(CTLineGetTypographicBounds($0, &ascent, &descent, &leading))
+            }
+            textLayout = SubtitleTextLayout(key: key, lines: wrappedLines, widths: lineWidths, ascent: ascent, descent: descent)
+            if cachesText { subtitleTextCache = textLayout }
         }
+        let wrappedLines = textLayout.lines
+        let lineWidths = textLayout.widths
+        let ascent = textLayout.ascent
+        let descent = textLayout.descent
         guard let widestLine = lineWidths.max(), widestLine > 0 else { return }
         let lineAdvance = (ascent + descent) * SubtitleBarMetrics.lineSpacingFactor
         let textHeight = ascent + descent + lineAdvance * CGFloat(wrappedLines.count - 1)

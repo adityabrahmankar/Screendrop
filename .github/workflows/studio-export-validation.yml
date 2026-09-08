@@ -1,0 +1,27 @@
+name: Studio export validation
+on:
+  workflow_dispatch:
+  push:
+    branches: ['perf/metal-studio-export-pass2-implementation']
+permissions:
+  contents: read
+concurrency:
+  group: studio-export-validation-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  native:
+    runs-on: macos-26
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Build and run native export regression suite
+        run: bash ExportReview/verify_macos.sh "$RUNNER_TEMP/export-results"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: studio-export-validation
+          path: ${{ runner.temp }}/export-results
+          retention-days: 7

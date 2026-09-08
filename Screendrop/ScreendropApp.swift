@@ -164,6 +164,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        #if DEBUG
+        if ProcessInfo.processInfo.environment["SCREENDROP_EXPORT_REVIEW"] != nil {
+            Task { @MainActor in
+                do { try await StudioExportReview.run(); exit(0) }
+                catch {
+                    FileHandle.standardError.write(Data("EXPORT REVIEW FAILED: \(error)\n".utf8))
+                    exit(1)
+                }
+            }
+            return
+        }
+        #endif
         NSApp.setActivationPolicy(.accessory)
         HotkeyManager.shared.registerHotkeys()
         updaterManager.start()
