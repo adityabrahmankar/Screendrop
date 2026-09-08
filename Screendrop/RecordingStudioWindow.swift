@@ -3193,6 +3193,12 @@ private struct StudioInspector: View {
 
     private var cameraControls: some View {
         VStack(alignment: .leading, spacing: InspectorMetrics.rowSpacing) {
+            InspectorSegmented(
+                options: RecordingCameraAspect.allCases,
+                isSelected: { RecordingCameraAspect(rawValue: model.style.camera.aspect) == $0 },
+                onTap: { model.style.camera.aspect = $0.rawValue },
+                label: { Text($0.title).font(.inspectorLabel) }
+            )
             InspectorSlider(
                 "Size",
                 value: $model.style.camera.size,
